@@ -1,0 +1,75 @@
+Running on CPU (even with XNNPACK optimizations) is inherently
+ less efficient than using DSPs, NPUs, or GPUs. Offloading 
+ computations can lead to energy savings of up to
+  50-80% per inference task.
+
+
+Execution Provider	Hardware Dependency	Availability on Android Devices
+ACL	ARM CPUs (Neon), Mali GPUs	Very High: Available on most ARM-based devices with or without Mali GPUs.
+ArmNN	ARM CPUs (Neon), Mali GPUs, NPU	High: Available on ARM-based devices but limited by NPU presence.
+QNN	Qualcomm Snapdragon Hexagon, Adreno GPUs	Very High: Common on devices using Snapdragon processors.
+
+ACL and QNN most popular
+
+Steps to Build ONNX Runtime with ACL, ArmNN, and QNN Support
+Clone ONNX Runtime Repository:
+
+bash
+git clone --recursive https://github.com/microsoft/onnxruntime.git
+cd onnxruntime
+Install Build Dependencies: Install required tools and libraries such as Python, CMake, Ninja, and compiler toolchains for cross-compilation.
+
+Enable Providers in Build Configuration: Modify the build configuration to enable the desired providers:
+
+bash
+Copy code
+./build.sh --config Release \
+    --build_shared_lib \
+    --use_acl \
+    --use_armnn \
+    --use_qnn \
+    --armnn_lib_path=<path_to_armnn> \
+    --acl_lib_path=<path_to_acl> \
+    --qnn_lib_path=<path_to_qnn>
+Cross-Compile for Android (if needed): Use Android NDK for building ONNX Runtime for ARM-based Android devices:
+
+bash
+Copy code
+./build.sh --config Release \
+    --android \
+    --android_abi=arm64-v8a \
+    --android_sdk_path=<path_to_sdk> \
+    --use_acl --use_armnn --use_qnn
+Test Your Build: Verify the build by running inference tests and ensuring the execution providers are successfully loaded.
+
+1. ACL (ARM Compute Library)
+License Requirements:
+ACL is distributed under an open-source license (Apache License 2.0), so no special permissions or licenses are required to use it.
+Dependencies:
+You need to download and build the ARM Compute Library manually before integrating it with ONNX Runtime.
+Download from the official GitHub repository: ARM Compute Library GitHub.
+Caveats:https://github.com/ARM-software/ComputeLibrary
+Building ACL requires specific dependencies such as CMake and a compiler supporting ARM Neon.
+No license issues, but you may need time to configure and build the library.
+
+https://github.com/ARM-software/ComputeLibrary
+
+ACL:
+Samsung Galaxy series (Exynos variants).
+MediaTek-powered devices like Xiaomi Redmi Note series.
+Huawei devices with HiSilicon Kirin processors.
+
+QNN:
+Google Pixel (Snapdragon variants).
+OnePlus, Xiaomi, and Samsung devices powered by Snapdragon processors.
+Flagship and mid-range phones like the Samsung Galaxy S series (Snapdragon variants) or Xiaomi Mi series.
+
+
+
+General optimization:
+ND4J	Java	Multi-dimensional arrays, linear algebra, random generation	Moderate	High (optimized)
+EJML	Java	Matrix operations, decomposition	Easy	Moderate
+Apache Commons Math	Java	Statistics, basic algebra	Easy	Moderate
+TensorFlow Lite	Java/Kotlin	Tensor operations, inference	Moderate	High (accelerated)
+Pyodide/Chaquopy	Python	Full NumPy support	Easy (if familiar with Python)	Moderate (requires runtime)
+Native Libraries	C/C++	Low-level matrix and algebra	Difficult	Very High

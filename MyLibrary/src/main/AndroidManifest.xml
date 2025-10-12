@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-sdk android:minSdkVersion="26" />
+
+    <!-- Required for microphone access in Android 14 -->
+    <!-- <uses-permission android:name="android.permission.CAPTURE_AUDIO_OUTPUT"/>  -->
+    <!-- <uses-permission android:name="android.permission.CAPTURE_MEDIA_OUTPUT"/>  -->
+
+</manifest>
+
