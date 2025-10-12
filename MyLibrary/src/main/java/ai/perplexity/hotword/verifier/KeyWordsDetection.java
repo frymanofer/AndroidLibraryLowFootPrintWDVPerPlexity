@@ -721,7 +721,8 @@ public class KeyWordsDetection {
                     extCarryLen = 0;
                 } catch (Throwable t) {
                     Log.e(TAG, "Failed to merge extCarry; processing immediately", t);
-                    detected = processOneKwFrameNoCB(pcm, length);
+                    detected = processOneKwFrameNoCB(extCarry, F);
+
                     extCarryLen = 0;
                     if (detected) {
                         return true;
@@ -767,7 +768,7 @@ public class KeyWordsDetection {
         while (offset + F <= length && isListening && isExternalMode.get()) {
             short[] frame = new short[F];
             System.arraycopy(pcm, offset, frame, 0, F);
-            detected = processOneKwFrameNoCB(pcm, length);
+            detected = processOneKwFrameNoCB(frame, F);
             if (detected) {
                 extCarryLen = 0;
                 return true;
