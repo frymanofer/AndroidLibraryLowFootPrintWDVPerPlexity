@@ -169,171 +169,23 @@ public class VadDetectorOnnx {
         String packageLibDir = context.getPackageResourcePath(); // Retrieve the package path
         File packageLib = new File(packageLibDir, "lib");
 
-        boolean nnapiAdded = true;
-        
-        // 1) Attempt to add QNN (Qualcomm Neural Network) if available
-        /* Need to build from github with support - check chatGPT 
-        ai.onnxruntime.OrtException: Error code - ORT_INVALID_ARGUMENT - message: This binary was not compiled with ArmNN support.
-        or 
-        ai.onnxruntime.OrtException: Error code - ORT_INVALID_ARGUMENT - message: QNN execution provider is not supported in this build. 
-*/
-        // ----------------------------------------------------------------------
-        //   QNN: Try adding multiple backends. Each attempt is in its own
-        //   try/catch so a failure doesn't block other backends. 
-        //   The "backend_path" must point to the relevant .so in jniLibs.
-        // ----------------------------------------------------------------------
-/*
-        // (B) QNN DSP
-        try {
-            Map<String, String> qnnOptionsDSP = new HashMap<>();
-            String libDir = copyAssetToInternalStorage("libQnnDsp.so");
+        final int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
 
-            qnnOptionsDSP.put("backend_path", libDir);
-            qnnOptionsDSP.put("backend", "DSP");
-            options.addQnn(qnnOptionsDSP);
-            Log.i(TAG, "QNN EP [DSP] added successfully (with backend_path).");
-        } catch (Exception e) {
-            Log.w(TAG, "QNN EP [DSP] not available or failed to load.", e);
-        }
-*//*
-        // (D) QNN HTP (sometimes also referred to as HPC)
         try {
-            Map<String, String> qnnOptionsHTP = new HashMap<>();
-            qnnOptionsHTP.put("backend_path", libDir + "/libQnnHtp.so");
-            qnnOptionsHTP.put("backend", "HTP");
-            options.addQnn(qnnOptionsHTP);
-            Log.i(TAG, "QNN EP [HTP] added successfully (with backend_path).");
-        } catch (Exception e) {
-            Log.w(TAG, "QNN EP [HTP] not available or failed to load.", e);
-        }
-
-
-        // (E) QNN HTA 
-        try {
-            Map<String, String> qnnOptionsHTA = new HashMap<>();
-            qnnOptionsHTA.put("backend_path", libDir + "/libQnnHta.so");
-            qnnOptionsHTA.put("backend", "HTA");
-            options.addQnn(qnnOptionsHTA);
-            Log.i(TAG, "QNN EP [HTA] added successfully (with backend_path).");
-        } catch (Exception e) {
-            Log.w(TAG, "QNN EP [HTA] not available or failed to load.", e);
-        }
-
-        // (C) QNN GPU
-        try {
-            Map<String, String> qnnOptionsGPU = new HashMap<>();
-            qnnOptionsGPU.put("backend_path", libDir + "/libQnnGpu.so");
-            qnnOptionsGPU.put("backend", "GPU");
-            options.addQnn(qnnOptionsGPU);
-            Log.i(TAG, "QNN EP [GPU] added successfully (with backend_path).");
-        } catch (Exception e) {
-            Log.w(TAG, "QNN EP [GPU] not available or failed to load.", e);
-        }
-
-        // (A) QNN CPU
-        try {
-            Map<String, String> qnnOptionsCPU = new HashMap<>();
-            qnnOptionsCPU.put("backend_path", libDir + "/libQnnCpu.so");
-            qnnOptionsCPU.put("backend", "CPU");  
-            // Additional QNN parameters as desired:
-            // qnnOptionsCPU.put("profiling_level", "default");
-            // qnnOptionsCPU.put("remote_heap", "true");
-            // ...
-            options.addQnn(qnnOptionsCPU);
-            Log.i(TAG, "QNN EP [CPU] added successfully (with backend_path).");
-        } catch (Exception e) {
-            Log.w(TAG, "QNN EP [CPU] not available or failed to load.", e);
-        }
-*/
-/*
-        try {
-            Map<String, String> qnnOptions = new HashMap<>();
-            // For example: qnnOptions.put("backend", "DSP");
-            // qnnOptions.put("profiling_level", "default");
-            // qnnOptions.put("remote_heap", "true"); etc.
-            options.addQnn(qnnOptions);
-            Log.i(TAG, "QNN EP added successfully.");
-        } catch (Exception e) {
-            Log.w(TAG, " or failed to load.", e);
-        }
-  */      
-        // 2) Attempt to add NNAPI
-        try {
-            options.addNnapi(); 
-            // or options.addNnapi(EnumSet.of(NNAPIFlags.CPU_DISABLED)) for specific flags
-            Log.i(TAG, "NNAPI EP added successfully.");
-        } catch (Exception e) {
-            Log.w(TAG, "NNAPI EP not available or failed to load.", e);
-        }
-
-        // Add CPU option
-        options.addCPU(true);
-        /* Need to build from github with support - check chatGPT 
-        ai.onnxruntime.OrtException: Error code - ORT_INVALID_ARGUMENT - message: This binary was not compiled with ArmNN support.
-        or 
-        ai.onnxruntime.OrtException: Error code - ORT_INVALID_ARGUMENT - message: QNN execution provider is not supported in this build. 
-
-        // 3) Attempt to add ArmNN
-        try {
-            boolean useArena = true;  // or false
-            options.addArmNN(useArena);
-            Log.i(TAG, "ArmNN EP added successfully.");
-        } catch (Exception e) {
-            Log.w(TAG, "ArmNN EP not available or failed to load.", e);
-        }
-        */
-        // 4) Attempt to add ACL (ARM Compute Library)
-        try {
-            boolean enableFastMath = true;  // or false
-            options.addACL(enableFastMath);
-            Log.i(TAG, "ACL EP added successfully.");
-        } catch (Exception e) {
-            Log.w(TAG, "ACL EP not available or failed to load.", e);
-        }
-
-        // 5) Attempt to add XNNPACK
-        try {
-            Map<String, String> xnnpackOpts = Collections.emptyMap(); // or new HashMap<>() with any specific options
+            Map<String, String> xnnpackOpts = Collections.emptyMap();
             options.addXnnpack(xnnpackOpts);
             Log.i(TAG, "XNNPACK EP added successfully.");
         } catch (Exception e) {
             Log.w(TAG, "XNNPACK EP not available or failed to load.", e);
         }
-        // 2) Use a lower graph optimization level if battery is a bigger concern than speed
-        // Start with ORT_ENABLE_ALL
-        // Than ORT_ENABLE_EXTENDED or ORT_ENABLE_BASIC
-        //options.setGraphOptimizationLevel(OrtSession.SessionOptions.OptLevel.ORT_ENABLE_EXTENDED);
-        if (nnapiAdded) {
-            // The device supports NNAPI. 
-            // Possibly keep the highest graph optimization level (ORT_ENABLE_ALL) 
-            // and single-thread or multi-thread settings as desired.
-            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-            Log.i(TAG, "NNAPI available. Using hardware acceleration + ORT_ENABLE_ALL.");
-        } else {
-            // Fallback if no NNAPI driver. 
-            // You might choose fewer threads, different optimization, etc.
-            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.EXTENDED_OPT);
-            Log.i(TAG, "NNAPI not available, using CPU fallback + ORT_ENABLE_EXTENDED.");
-        }
 
-        // 3) Limit threads (less CPU usage => lower battery drain)
-        options.setIntraOpNumThreads(1);
+        options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+//            options.setIntraOpNumThreads(Math.min(2, cores)); Best????
+        options.setIntraOpNumThreads(Math.min(2, cores)); 
         options.setInterOpNumThreads(1);
-
-        // 4) Optionally set execution mode
-        options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
-
-        //  CPU Arena Allocator: 
-        //    - "true" can speed up repeated inferences by reusing memory blocks (often beneficial overall).
-        //    - "false" might reduce memory overhead if you do few inferences. Usually "true" is recommended.
+        options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.PARALLEL);
         options.setCPUArenaAllocator(true);
-
-        // Memory Pattern Optimization:
-        //    - "true" pre-allocates memory patterns for known shapes. Tends to speed up repeated inferences 
-        //      => potentially less CPU time => less battery usage.
-        //    - "false" if shapes vary wildly or you have memory constraints. 
         options.setMemoryPatternOptimization(true);
-
         options.setSessionLogVerbosityLevel(0);
 
         session = env.createSession(modelPath, options);

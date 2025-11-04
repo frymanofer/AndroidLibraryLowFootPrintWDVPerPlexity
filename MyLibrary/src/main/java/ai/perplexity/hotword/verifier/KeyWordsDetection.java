@@ -62,6 +62,12 @@ public class KeyWordsDetection {
     private static final int MEL_SPECTROGRAM_MAX_LEN = 10 * 97;
     private static final int SAMPLE_RATE = 16000; // currently
     private static final int RAW_BUFFER_MAX_LEN = (1280 * 2);
+    // tail padding (ms) used by both v1 and v2 external full-buffer APIs
+    private static final int HEAD_PAD_MS = 1000;
+    private static final int TAIL_PAD_MS = 1000;
+    // 2-second keyword clip length used during training (from Python kwd_clip_length)
+    private static final int V2_KWD_CLIP_SAMPLES = 31712;
+
     private final int featureBufferMaxLen = 120;
     private Deque<float[]> featureDeque = new ArrayDeque<>();
 
@@ -110,6 +116,9 @@ public class KeyWordsDetection {
     private final ArrayList<float[][]> bulkWindows = new ArrayList<>(512);
     private boolean bulkCollecting = false; // true while ingesting the "head" of a bulk push
 
+    private int melspecInputRank = 1; // 1D or 2D (batch, time)
+    private static final float INV_SHORT_MAX = 1.0f / 32768.0f;
+
     // Reusable tiny objects to reduce churn
     private final Map<String, OnnxTensor> embeddingInputsReusable = new HashMap<>();
 
@@ -155,7 +164,7 @@ public class KeyWordsDetection {
                             long[] msBetweenCallback)
             throws OrtException, SecurityException {
 
-        //Log.d(TAG, "KeyWordsDetection new constructor: ");
+        Log.d(TAG, "KeyWordsDetection constructor: ");
         this.keyThreasholds = thresholds;
         this.keyBufferCnts = bufferCnts;
         this.msBetweenCallbacks = msBetweenCallback;
@@ -172,13 +181,13 @@ public class KeyWordsDetection {
             perModellPredictions[i] = 0;
         }
 
-        //Log.d(TAG, "KeyWordsDetection constructor: keyThreasholds: " + keyThreasholds);
-        //Log.d(TAG, "KeyWordsDetection constructor: fakeThresholds: " + fakeThresholds);
+        Log.d(TAG, "KeyWordsDetection constructor: keyThreasholds: " + keyThreasholds);
+        Log.d(TAG, "KeyWordsDetection constructor: fakeThresholds: " + fakeThresholds);
         audioBuffer = new short[LAST_SEC_BUFF_SIZE];
         Arrays.fill(audioBuffer, (short) 0);
 
         Arrays.fill(zeroArr, (short) 0);
-        //Log.d(TAG, "KeyWordsDetection constructor: keyBufferCnts: " + keyBufferCnts);
+        Log.d(TAG, "KeyWordsDetection constructor: keyBufferCnts: " + keyBufferCnts);
         inputs = new HashMap<>();
 
         this.context = context;
@@ -186,6 +195,8 @@ public class KeyWordsDetection {
         internalModelPaths = new String[modelPaths.length];
 
         Boolean isPlex = false;
+
+        Log.d(TAG, "KeyWordsDetection constructor: modelPaths.length: " + modelPaths.length);
 
         for (int i = 0; i < modelPaths.length; i++) {
             String name = modelPaths[i];
@@ -197,6 +208,7 @@ public class KeyWordsDetection {
                  ? copyAssetToInternalStorage(modelPaths[i])
                  : modelPaths[i];
             internalModelPaths[i] = expandDmReturnFirstOnnxIfNeeded(local);
+            logOnnxAndData(internalModelPaths[i]);
         }
 
         String[] layer1 = extractLayer1IfPresent();
@@ -226,16 +238,6 @@ public class KeyWordsDetection {
 
             final int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
 
-            // boolean nnapiAdded = false;
-            // try {
-            //     // Try NNAPI (may or may not help depending on model ops/quant)
-            //     options.addNnapi();
-            //     nnapiAdded = true;
-            //     Log.i(TAG, "NNAPI EP added successfully.");
-            // } catch (Exception e) {
-            //     Log.w(TAG, "NNAPI EP not available or failed to load.", e);
-            // }
-
             try {
                 Map<String, String> xnnpackOpts = Collections.emptyMap();
                 options.addXnnpack(xnnpackOpts);
@@ -253,19 +255,58 @@ public class KeyWordsDetection {
             options.setMemoryPatternOptimization(true);
             options.setSessionLogVerbosityLevel(0);
 
-            melspecSession = env.createSession(melspecPath, options);
-            embeddingSession = env.createSession(embeddingPath, options);
+            try {
+                melspecSession = env.createSession(melspecPath, options);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to create melspecSession from " + melspecPath, e);
+                throw e;
+            }
+// IMPORTANT: initialize melspecInputNames before using it
+try {
+    melspecInputNames = melspecSession.getInputNames();
+    Map<String, NodeInfo> melInputInfoMap = melspecSession.getInputInfo();
+
+    // pick the first input name
+    String melInputName = melspecInputNames.iterator().next();
+    TensorInfo melTensorInfo = (TensorInfo) melInputInfoMap.get(melInputName).getInfo();
+    long[] melShape = melTensorInfo.getShape();
+
+    melspecInputRank = (melShape == null) ? 1 : melShape.length;
+    Log.i(TAG, "melspec input rank = " + melspecInputRank +
+            " shape=" + Arrays.toString(melShape));
+} catch (Exception e) {
+    Log.w(TAG, "Could not read melspec input shape; defaulting to rank 2 [1, N]", e);
+    // If you KNOW your exported model is [1, N], it's safer to default to 2:
+    melspecInputRank = 2;
+}
+
+            try {
+                embeddingSession = env.createSession(embeddingPath, options);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to create embeddingSession from " + embeddingPath, e);
+                throw e;
+            }
 
             embeddingInputNames = embeddingSession.getInputNames();
             melspecInputNames = melspecSession.getInputNames();
 
             rawDataBuffer = new ArrayDeque<>(RAW_BUFFER_MAX_LEN);
             melspectrogramBuffer = new ArrayList<>();
+
             sessions = new OrtSession[modelPaths.length];
             inputNames      = new ArrayList[modelPaths.length];
             nFeatureFrames  = new    int  [modelPaths.length];
             for (int i = 0; i < modelPaths.length; i++) {
-                sessions[i] = env.createSession(internalModelPaths[i], options);
+                                try {
+                Log.i(TAG, "Creating KWS session from: " + internalModelPaths[i]);
+                    sessions[i] = env.createSession(internalModelPaths[i], options);
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to create KWS session[" + i + "] from "
+                            + internalModelPaths[i], e);
+                    throw e;
+                }
+
+                // sessions[i] = env.createSession(internalModelPaths[i], options);
                 inputNames[i] = new ArrayList<>(sessions[i].getInputNames());
                 Map<String, NodeInfo> inputInfoMap = sessions[i].getInputInfo();
                 NodeInfo inputInfo = inputInfoMap.get(inputNames[i].get(0));
@@ -304,6 +345,21 @@ public class KeyWordsDetection {
         } catch (OrtException e) {
             e.printStackTrace();
             throw e;
+        }
+    }
+
+        private void logOnnxAndData(String onnxPath) {
+        try {
+            File onnx = new File(onnxPath);
+            File data = new File(onnxPath + ".data");
+
+            Log.i(TAG, "ONNX model path: " + onnx.getAbsolutePath()
+                    + " exists=" + onnx.exists() + " size=" + (onnx.exists() ? onnx.length() : -1));
+
+            Log.i(TAG, "ONNX external data path: " + data.getAbsolutePath()
+                    + " exists=" + data.exists() + " size=" + (data.exists() ? data.length() : -1));
+        } catch (Throwable t) {
+            Log.e(TAG, "logOnnxAndData failed", t);
         }
     }
 
@@ -528,7 +584,7 @@ public class KeyWordsDetection {
         int numCols = numRows > 0 ? melspectrogramBuffer.get(0).length : 0;
     }
 
-    private String copyAssetToInternalStorage(String assetName) {
+    private String copyAssetToInternalStorage_v1(String assetName) {
         File file = new File(context.getFilesDir(), assetName);
         File parentFile = file.getParentFile();
         if (!parentFile.exists()) {
@@ -557,6 +613,78 @@ public class KeyWordsDetection {
                 return null;
             }
         }
+        return file.getAbsolutePath();
+    }
+
+    private String copyAssetToInternalStorage(String assetName) {
+        File file = new File(context.getFilesDir(), assetName);
+        File parentFile = file.getParentFile();
+        if (!parentFile.exists()) {
+            boolean dirsCreated = parentFile.mkdirs();
+        }
+
+        if (file.exists()) {
+            boolean deleted = file.delete();
+            //Log.d(TAG, "Existing asset deleted: " + deleted);
+        }
+
+        AssetManager assetManager = context.getAssets();
+
+        // 1) Copy the main asset (e.g. hey_plex.onnx)
+        if (!file.exists()) {
+            try {
+                InputStream in = assetManager.open(assetName);
+                FileOutputStream out = new FileOutputStream(file);
+                byte[] buffer = new byte[1024];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                }
+                in.close();
+                out.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Failed to copy asset file: " + assetName, e);
+                return null;
+            }
+        }
+
+        // 2) If this is an ONNX file, also copy the external data file "<name>.onnx.data" if it exists.
+        //    ONNX Runtime will automatically pick it up as long as it sits next to the .onnx.
+        if (assetName.endsWith(".onnx")) {
+            String dataAssetName = assetName + ".data";  // e.g. "hey_plex.onnx.data" or "models/hey_plex.onnx.data"
+            if (assetExists(dataAssetName)) {
+                File dataFile = new File(context.getFilesDir(), dataAssetName);
+                File dataParent = dataFile.getParentFile();
+                if (!dataParent.exists()) {
+                    boolean created = dataParent.mkdirs();
+                }
+
+                if (dataFile.exists()) {
+                    boolean deletedData = dataFile.delete();
+                    //Log.d(TAG, "Existing .onnx.data deleted: " + deletedData);
+                }
+
+                try {
+                    InputStream din = assetManager.open(dataAssetName);
+                    FileOutputStream dout = new FileOutputStream(dataFile);
+                    byte[] dbuf = new byte[1024];
+                    int dread;
+                    while ((dread = din.read(dbuf)) != -1) {
+                        dout.write(dbuf, 0, dread);
+                    }
+                    din.close();
+                    dout.close();
+                    //Log.d(TAG, "Copied ONNX external data asset: " + dataAssetName);
+                } catch (IOException e) {
+                    Log.e(TAG, "Failed to copy ONNX .data asset file: " + dataAssetName, e);
+                    // We don't return null here because the main .onnx is present; you can decide how strict you want to be.
+                }
+            } else {
+                // Optional: log if .data is missing; ORT will still work if the model is not using external data.
+                //Log.d(TAG, "No ONNX .data asset found for: " + assetName);
+            }
+        }
+
         return file.getAbsolutePath();
     }
 
@@ -696,7 +824,407 @@ public class KeyWordsDetection {
         bulkMinSamples = Math.max(1280 * 2, samples);
     }
 
+    // Wrapper: by default we use v2 (direct mel->ONNX KWS). You can flip to _v1 if needed.
     public boolean predictFromExternalFullBuffer(short[] pcm, int length) {
+        return predictFromExternalFullBuffer_v2(pcm, length);
+        // If you want the old behaviour:
+        // return predictFromExternalFullBuffer_v1(pcm, length);
+    }
+    
+// v2 helper: run ONNX KWS model directly on mel [T,F] -> probability (positive class)
+private float runKwsModelOnMel(int modelIndex, float[][] mel) {
+    if (sessions == null || modelIndex < 0 || modelIndex >= sessions.length) {
+        return 0.0f;
+    }
+    if (mel == null || mel.length == 0 || mel[0] == null) {
+        return 0.0f;
+    }
+
+    int T = mel.length;
+    int F = mel[0].length;
+
+    OnnxTensor inputTensor = null;
+    OrtSession.Result result = null;
+    Map<String, OnnxTensor> localInputs = null;
+
+    try {
+        String inputName = inputNames[modelIndex].get(0);
+        Map<String, NodeInfo> inputInfoMap = sessions[modelIndex].getInputInfo();
+        TensorInfo tinfo = (TensorInfo) inputInfoMap.get(inputName).getInfo();
+        long[] modelShape = tinfo.getShape();
+        int rank = (modelShape != null ? modelShape.length : 0);
+
+        float[][] melAdj = mel;  // may adjust T to match model
+        long[] shape;
+
+        if (rank == 3) {
+            // (B, T_model, F_model)
+            long tModel = modelShape[1];
+            long fModel = modelShape[2];
+
+            if (fModel > 0 && fModel != F) {
+                Log.e(TAG, "runKwsModelOnMel: mel F mismatch (model F=" + fModel + ", got " + F + ")");
+                return 0.0f;
+            }
+
+            if (tModel > 0 && tModel != T) {
+                int targetT = (int) tModel;
+                float[][] newMel = new float[targetT][F];
+
+                if (T >= targetT) {
+                    // keep last targetT frames
+                    int start = T - targetT;
+                    for (int i = 0; i < targetT; i++) {
+                        newMel[i] = mel[start + i];
+                    }
+                } else {
+                    // pad at front with zeros, place mel at the end
+                    int pad = targetT - T;
+                    for (int i = 0; i < pad; i++) {
+                        newMel[i] = new float[F]; // zeros
+                    }
+                    for (int i = 0; i < T; i++) {
+                        newMel[pad + i] = mel[i];
+                    }
+                }
+                melAdj = newMel;
+                T = targetT;
+            }
+
+            float[] flattened = flatten(melAdj);
+            shape = new long[]{1, T, F};
+            inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flattened), shape);
+        } else if (rank == 4) {
+            // (B, C, T_model, F_model) with C=1
+            long cModel = modelShape[1];
+            long tModel = modelShape[2];
+            long fModel = modelShape[3];
+
+            if (cModel != 1 && cModel > 0) {
+                Log.e(TAG, "runKwsModelOnMel: unexpected channel dim (shape[1]=" + cModel + ")");
+                return 0.0f;
+            }
+            if (fModel > 0 && fModel != F) {
+                Log.e(TAG, "runKwsModelOnMel: mel F mismatch (model F=" + fModel + ", got " + F + ")");
+                return 0.0f;
+            }
+
+            if (tModel > 0 && tModel != T) {
+                int targetT = (int) tModel;
+                float[][] newMel = new float[targetT][F];
+
+                if (T >= targetT) {
+                    // keep last targetT frames
+                    int start = T - targetT;
+                    for (int i = 0; i < targetT; i++) {
+                        newMel[i] = mel[start + i];
+                    }
+                } else {
+                    // pad at front with zeros, place mel at the end
+                    int pad = targetT - T;
+                    for (int i = 0; i < pad; i++) {
+                        newMel[i] = new float[F];
+                    }
+                    for (int i = 0; i < T; i++) {
+                        newMel[pad + i] = mel[i];
+                    }
+                }
+                melAdj = newMel;
+                T = targetT;
+            }
+
+            float[] flattened = flatten(melAdj);
+            shape = new long[]{1, 1, T, F}; // (B, C=1, T, F)
+            inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flattened), shape);
+        } else {
+            Log.e(TAG, "runKwsModelOnMel: unsupported input rank " + rank);
+            return 0.0f;
+        }
+
+        localInputs = new HashMap<>();
+        localInputs.put(inputName, inputTensor);
+
+        result = sessions[modelIndex].run(localInputs);
+        Object out = result.get(0).getValue();
+
+        // logits -> probability of positive class
+        if (out instanceof float[][]) {
+            float[][] logits2D = (float[][]) out;
+            if (logits2D.length == 0 || logits2D[0] == null || logits2D[0].length == 0) {
+                return 0.0f;
+            }
+            float[] logits = logits2D[0];
+            if (logits.length == 1) return logits[0];
+
+            float l0 = logits[0];
+            float l1 = logits[1];
+            float m = Math.max(l0, l1);
+            float e0 = (float) Math.exp(l0 - m);
+            float e1 = (float) Math.exp(l1 - m);
+            return e1 / (e0 + e1);
+        } else if (out instanceof float[]) {
+            float[] logits = (float[]) out;
+            if (logits.length == 0) return 0.0f;
+            if (logits.length == 1) return logits[0];
+
+            float l0 = logits[0];
+            float l1 = logits[1];
+            float m = Math.max(l0, l1);
+            float e0 = (float) Math.exp(l0 - m);
+            float e1 = (float) Math.exp(l1 - m);
+            return e1 / (e0 + e1);
+        } else {
+            Log.w(TAG, "runKwsModelOnMel: unexpected output type " + out.getClass());
+            return 0.0f;
+        }
+    } catch (Exception e) {
+        Log.e(TAG, "runKwsModelOnMel failed: " + e.getMessage());
+        return 0.0f;
+    } finally {
+        if (localInputs != null) {
+            localInputs.clear();
+        }
+        if (result != null) result.close();
+        if (inputTensor != null) inputTensor.close();
+    }
+}
+
+    // small helper: logits -> prob(class 1)
+    private float softmaxPositive(float[] logits) {
+        if (logits == null || logits.length == 0) return 0.0f;
+        if (logits.length == 1) return logits[0]; // model already outputs prob/logit for positive class
+
+        float l0 = logits[0];
+        float l1 = logits[1];
+        float m = Math.max(l0, l1);
+        float e0 = (float) Math.exp(l0 - m);
+        float e1 = (float) Math.exp(l1 - m);
+        return e1 / (e0 + e1);
+    }
+
+// v2-specific: melspec from ONNX WITHOUT the /10 + 2 transform
+private float[][] getMelspectrogramForV2(short[] audioData) {
+    float[] audioDataFloat = new float[audioData.length];
+    for (int i = 0; i < audioData.length; i++) {
+        // same normalization as Python waveform
+        audioDataFloat[i] = audioData[i] * INV_SHORT_MAX;
+    }
+
+    long[] inputShape;
+    if (melspecInputRank == 1) {
+        // Python: waveform.numpy() 1D
+        inputShape = new long[]{audioDataFloat.length};
+    } else {
+        // Python: waveform.numpy() 2D [1, N]
+        inputShape = new long[]{1, audioDataFloat.length};
+    }
+    OnnxTensor inputTensor = null;
+    OrtSession.Result result = null;
+    String melSpecInputName = null;
+    Map<String, OnnxTensor> localInputs = null;
+
+    try {
+        inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(audioDataFloat), inputShape);
+        localInputs = new HashMap<>();
+        melSpecInputName = melspecInputNames.iterator().next();
+        localInputs.put(melSpecInputName, inputTensor);
+
+        result = melspecSession.run(localInputs);
+        Object output = result.get(0).getValue();
+
+        // Same helper you already have
+        return coerceMelTo2D(output);  // [T,F]
+    } catch (Exception e) {
+        Log.e(TAG, "getMelspectrogramForV2: failed to run melspec session: " + e.getMessage());
+        return new float[0][0];
+    } finally {
+        if (localInputs != null && melSpecInputName != null) {
+            localInputs.remove(melSpecInputName);
+        }
+        if (result != null) result.close();
+        if (inputTensor != null) inputTensor.close();
+    }
+}
+
+    // v2: per-frame path – streaming mel, no embeddings, direct KWS ONNX
+    private boolean processOneKwFrameV2(short[] frame, int frameLength) {
+        try {
+            // 1) update raw buffer (same as other paths)
+            bufferRawData(frame);
+            if (rawDataBuffer.size() < MIN_COLLECT_SAMPLES) {
+                return false; // not enough audio yet
+            }
+
+            // 2) streaming mel update using existing logic
+            streamingMelspectrogram(frameLength);
+
+            int ndx = getMelNumberOfRows();
+            if (ndx < 76) {
+                return false; // need at least 76 mel frames
+            }
+
+            // 3) take last 76×32 window
+            float[][][][] melspectrogramSlice = getMelspecSubArray(ndx - 76, ndx);
+            float[][] melWindow = flattenSubArray(melspectrogramSlice); // [76, 32]
+
+            if (sessions == null || sessions.length == 0) {
+                return false;
+            }
+
+            boolean detected = false;
+
+            // 4) run each ONNX KWS model directly on this mel window
+            for (int i = 0; i < sessions.length; i++) {
+                float meanPrediction = runKwsModelOnMel(i, melWindow);
+
+                if (meanPrediction > fakeThresholds[i]) {
+                    if (meanPrediction < keyThreasholds[i]) {
+                        concurrentPredictions[i] = 0;
+                    } else {
+                        concurrentPredictions[i]++;
+                        if (concurrentPredictions[i] >= keyBufferCnts[i]) {
+                            long now = System.currentTimeMillis();
+                            if (lastCallbackInMS[i] + msBetweenCallbacks[i] <= now) {
+                                lastCallbackInMS[i] = now;
+                                String fileName = strippedModelNames[i] + "_prediction.wav";
+                                flushBufferToWav(fileName);
+                                if (keywordDetectedCallback != null) {
+                                    keywordDetectedCallback.accept(true, strippedModelNames[i]);
+                                }
+                                detected = true;
+                            }
+                            concurrentPredictions[i] = 0;
+                        }
+                    }
+                } else {
+                    concurrentPredictions[i] = 0;
+                }
+            }
+            return detected;
+        } catch (Throwable fatal) {
+            Log.e(TAG, "processOneKwFrameV2 failed – stopping detector", fatal);
+            stopListening();
+            return false;
+        }
+    }
+
+// === v2: streaming over full buffer + head/tail pad -> melspec ONNX -> KWS ONNX ===
+// === v2: match Python eval_wav_fixed_windows (PCM sliding) ===
+public boolean predictFromExternalFullBuffer_v2(short[] pcm, int length) {
+    if (!isListening || !isExternalMode.get() || pcm == null || length <= 0) return false;
+
+    final int SR          = SAMPLE_RATE;             // 16000
+    final int STRIDE_SAMP = Constants.FRAME_LENGTH;  // 1280
+    final int KWD_CLIP    = V2_KWD_CLIP_SAMPLES;     // 31712
+
+    // Keep WAV debug behaviour (3s ring buffer)
+    int storeOffset = 0;
+    while (storeOffset < length) {
+        int frameLen = Math.min(STRIDE_SAMP, length - storeOffset);
+        short[] frame = new short[frameLen];
+        System.arraycopy(pcm, storeOffset, frame, 0, frameLen);
+        storeFrame(frame, frameLen);
+        storeOffset += frameLen;
+    }
+
+    long t0 = tNow();
+
+    try {
+        // ---- 1) Build wav buffer like Python eval_wav_fixed_windows ----
+        int total = length;
+
+        // If shorter than KWD_CLIP: pad at FRONT
+        int frontPad = 0;
+        if (total < KWD_CLIP) {
+            frontPad = KWD_CLIP - total;
+            total = KWD_CLIP;
+        }
+
+        // Tail pad = stride * 30 (same as Python: pad_amount = stride * 30)
+        int tailPad = STRIDE_SAMP * 30;
+        total += tailPad;
+
+        short[] wav = new short[total];
+        // frontPad samples stay zero
+        System.arraycopy(pcm, 0, wav, frontPad, length);
+        // tailPad zeros at the end
+
+        int T_total = total;
+        int nSteps  = 1 + (int) Math.floor((T_total - KWD_CLIP) / (double) STRIDE_SAMP);
+        if (nSteps <= 0) {
+            Log.w(TAG, "predictFromExternalFullBuffer_v2: nSteps <= 0");
+            return false;
+        }
+
+        if (sessions == null || sessions.length == 0) return false;
+
+        boolean detected = false;
+
+        // ---- 2) Slide PCM windows exactly like Python ----
+        for (int step = 0;
+             step < nSteps && isListening && isExternalMode.get() && !detected;
+             step++) {
+
+            int windowStart = step * STRIDE_SAMP;
+            int windowEnd   = windowStart + KWD_CLIP;
+
+            if (windowEnd > T_total) break;
+
+            // Extract PCM chunk [KWD_CLIP] samples
+            short[] chunk = new short[KWD_CLIP];
+            System.arraycopy(wav, windowStart, chunk, 0, KWD_CLIP);
+
+            // ---- 3) ONNX melspec for this chunk (v2: NO /10+2 here) ----
+            float[][] mel = getMelspectrogramForV2(chunk); // [T,F]
+            if (mel == null || mel.length == 0 || mel[0] == null) {
+                continue;
+            }
+
+            // ---- 4) Run each KWS ONNX model on this mel window ----
+            for (int i = 0; i < sessions.length; i++) {
+                float meanPrediction = runKwsModelOnMel(i, mel);
+                // Log.d(TAG, "v2 step=" + step + " t=" +
+                //         (windowStart / (float) SR) + "s model " + i +
+                //         " meanPrediction = " + meanPrediction);
+
+                if (meanPrediction > fakeThresholds[i]) {
+                    if (meanPrediction < keyThreasholds[i]) {
+                        concurrentPredictions[i] = 0;
+                    } else {
+                        concurrentPredictions[i]++;
+                        if (concurrentPredictions[i] >= keyBufferCnts[i]) {
+                            long now = System.currentTimeMillis();
+                            if (lastCallbackInMS[i] + msBetweenCallbacks[i] <= now) {
+                                lastCallbackInMS[i] = now;
+                                String fileName = strippedModelNames[i] + "_prediction_v2.wav";
+                                flushBufferToWav(fileName);
+                                if (keywordDetectedCallback != null) {
+                                    keywordDetectedCallback.accept(true, strippedModelNames[i]);
+                                }
+                                detected = true;
+                            }
+                            concurrentPredictions[i] = 0;
+                        }
+                    }
+                } else {
+                    concurrentPredictions[i] = 0;
+                }
+
+                if (detected) break;
+            }
+        }
+
+        Log.d(TAG, "predictFromExternalFullBuffer_v2: " +
+                (detected ? "Predicted after time: " : "False reported after time: ") + tMs(t0));
+        return detected;
+    } catch (Throwable fatal) {
+        Log.e(TAG, "predictFromExternalFullBuffer_v2 failed – stopping detector", fatal);
+        stopListening();
+        return false;
+    }
+}
+
+    public boolean predictFromExternalFullBuffer_v1(short[] pcm, int length) {
         if (!isListening || !isExternalMode.get() || pcm == null || length <= 0) return false;
         boolean detected = false;
         //Log.d(TAG, "predictFromExternalFullBuffer");
@@ -705,8 +1233,7 @@ public class KeyWordsDetection {
         int offset = 0;//F * 7; // Skip first 6 frames ~ 500 ms
 
         // === Add 200ms tail padding ===
-        final int PAD_MS = 1000;
-        final int padSamples = (Constants.SAMPLE_RATE * PAD_MS) / 1000;
+        final int padSamples = (Constants.SAMPLE_RATE * TAIL_PAD_MS) / 1000;
 
         // // Merge any carried partial from previous call
         // if (extCarryLen > 0) {
@@ -1155,7 +1682,8 @@ public class KeyWordsDetection {
     private float[][] getMelspectrogramShort(short[] audioData) {
         float[] audioDataFloat = new float[audioData.length];
         for (int i = 0; i < audioData.length; i++) {
-            audioDataFloat[i] = (float) audioData[i];
+            // match Python torchaudio waveform ~[-1, 1]
+            audioDataFloat[i] = audioData[i] * INV_SHORT_MAX;
         }
         return getMelspectrogram(audioDataFloat);
     }
@@ -1355,7 +1883,14 @@ private static float[][] coerceByGuessingTF3D(float[][][] m3) {
         //long t0 = tNow();
         //Log.d(TAG, "getMelspectrogram()");
 
-        long[] inputShape = new long[]{1, audioDataFloat.length};
+        long[] inputShape;
+        if (melspecInputRank == 1) {
+            // Python: waveform.numpy() 1D
+            inputShape = new long[]{audioDataFloat.length};
+        } else {
+            // Python: waveform.numpy() 2D [1, N]
+            inputShape = new long[]{1, audioDataFloat.length};
+        }
         OnnxTensor inputTensor = null;
         OrtSession.Result result = null;
         String melSpecInputName = null;
