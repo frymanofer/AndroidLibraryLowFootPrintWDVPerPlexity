@@ -1,4 +1,3 @@
-/* FULL FILE — BULK-HEAD EMBEDDING BATCH + TAIL PER-FRAME — NO API REMOVED */
 
 package ai.perplexity.hotword.verifier;
 
@@ -43,13 +42,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class KeyWordsDetection {
 
-    private static final String DM_DELIM = "####%$#$%$#^&^*&*^#$%#$%#$#%^&&*****###";
     private String vadPath = null;
 
     private OrtEnvironment env = null;
     private OrtSession[] sessions;
     private OrtSession melspecSession;
-    private OrtSession embeddingSession;
     private final String TAG = "KeyWordsDetection";
     private Context context;
     private Map<String, OnnxTensor> inputs;
@@ -57,7 +54,6 @@ public class KeyWordsDetection {
     private int[] nFeatureFrames;
     private volatile boolean isListening;
     private int bufferSize = 0;
-    private Set<String> embeddingInputNames;
     private Set<String> melspecInputNames;
     private static final int MEL_SPECTROGRAM_MAX_LEN = 10 * 97;
     private static final int SAMPLE_RATE = 16000; // currently
@@ -112,7 +108,6 @@ public class KeyWordsDetection {
     private volatile float   bulkOptimizeRatio   = 0.80f; // start predicting after this ratio of audio has been ingested
     private volatile int     bulkMinSamples      = 5000;
 
-    // === Bulk-embedding (head) collection ===
     private final ArrayList<float[][]> bulkWindows = new ArrayList<>(512);
     private boolean bulkCollecting = false; // true while ingesting the "head" of a bulk push
 
@@ -120,8 +115,6 @@ public class KeyWordsDetection {
     private static final float INV_SHORT_MAX = 1.0f / 32768.0f;
 
     // Reusable tiny objects to reduce churn
-    private final Map<String, OnnxTensor> embeddingInputsReusable = new HashMap<>();
-
     // === Timing helpers (added) ===
     private static long tNow() { return System.nanoTime(); }
     private static String tMs(long t0) {
@@ -207,26 +200,14 @@ public class KeyWordsDetection {
             String local = assetExists(modelPaths[i])
                  ? copyAssetToInternalStorage(modelPaths[i])
                  : modelPaths[i];
-            internalModelPaths[i] = expandDmReturnFirstOnnxIfNeeded(local);
+            internalModelPaths[i] = local;
             logOnnxAndData(internalModelPaths[i]);
         }
-
-        String[] layer1 = extractLayer1IfPresent();
-        String melspecPath, embeddingPath;
-        if (layer1 != null) {
-            melspecPath   = layer1[0];
-            embeddingPath = layer1[1];
-            vadPath = layer1[2];
-            Log.i(TAG, "Loaded Layer1 from layer1.dm");
-        } else {
-            melspecPath   = copyAssetIfExists("melspectrogram.onnx");
-            embeddingPath = copyAssetIfExists("embedding_model.onnx");
-            vadPath = copyAssetIfExists("silero_vad.onnx");
-        }
-        Log.i(TAG, " layer1[0]:" + melspecPath + "layer1[1]" +  embeddingPath + "layer1[2]" + vadPath);
-
+        String melspecPath;
+        melspecPath   = copyAssetIfExists("melspectrogram.onnx");
+ 
         Log.i(TAG, "internalModelPaths[0] == " + internalModelPaths[0]);
-        if (internalModelPaths[0] == null || melspecPath == null || embeddingPath == null) {
+        if (internalModelPaths[0] == null || melspecPath == null) {
             Log.e(TAG, "KeyWordsDetection: Model path is null after copying asset.");
             throw new OrtException("Failed to copy model asset to internal storage.");
         }
@@ -280,14 +261,6 @@ try {
     melspecInputRank = 2;
 }
 
-            try {
-                embeddingSession = env.createSession(embeddingPath, options);
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to create embeddingSession from " + embeddingPath, e);
-                throw e;
-            }
-
-            embeddingInputNames = embeddingSession.getInputNames();
             melspecInputNames = melspecSession.getInputNames();
 
             rawDataBuffer = new ArrayDeque<>(RAW_BUFFER_MAX_LEN);
@@ -336,12 +309,13 @@ try {
 
             randomData = new short[randomDataSize]; // zeroes!!!
             featureDeque.clear();
-            float[][] randomEmbeds = getEmbeddings(randomData);
-            if (randomEmbeds != null) {
-                for (float[] row : randomEmbeds) {
-                    updateFeatureQueue(row);
-                }
+            int initLen = featureBufferMaxLen; // typically 120
+            for (int i = 0; i < initLen; i++) {
+                float[] row = new float[96];                  // Java initializes to 0.0f by default
+                updateFeatureQueue(row);
             }
+            warmupModels();
+
         } catch (OrtException e) {
             e.printStackTrace();
             throw e;
@@ -384,10 +358,6 @@ try {
         if (melspecSession != null) {
             try { melspecSession.close(); } catch (Exception ignored) {}
             melspecSession = null;
-        }
-        if (embeddingSession != null) {
-            try { embeddingSession.close(); } catch (Exception ignored) {}
-            embeddingSession = null;
         }
         if (env != null) {
             try { env.close(); } catch (Exception ignored) {}
@@ -755,6 +725,34 @@ try {
         context.startActivity(intent);
     }
 
+// One-time warmup for melspec + KWS models
+private void warmupModels() {
+    try {
+        // silent 2-second clip, same length as training
+        short[] silent = new short[V2_KWD_CLIP_SAMPLES];
+
+        // Warm up melspectrogram ONNX
+        float[][] mel = getMelspectrogramForV2(silent); // [T, F]
+        if (mel == null || mel.length == 0 || mel[0] == null) {
+            Log.w(TAG, "warmupModels: melspec returned empty output");
+            return;
+        }
+
+        // Warm up each KWS ONNX session once
+        if (sessions != null) {
+            for (int i = 0; i < sessions.length; i++) {
+                try {
+                    runKwsModelOnMel(i, mel);
+                } catch (Exception e) {
+                    Log.w(TAG, "warmupModels: KWS session[" + i + "] warmup failed", e);
+                }
+            }
+        }
+        Log.i(TAG, "warmupModels: warmup completed");
+    } catch (Throwable t) {
+        Log.w(TAG, "warmupModels: overall warmup failed", t);
+    }
+}
 
     public void startListeningExternalAudio(float threshold) {
         if (isListening) {
@@ -793,14 +791,14 @@ try {
             bulkWindows.clear();
             bulkCollecting = false;
 
-            randomData = new short[randomDataSize]; // zeroes!!!
             featureDeque.clear();
-            float[][] randomEmbeds = getEmbeddings(randomData);
-            if (randomEmbeds != null) {
-                for (float[] row : randomEmbeds) {
-                    updateFeatureQueue(row);
-                }
+            int initLen = featureBufferMaxLen; // typically 120
+            for (int i = 0; i < initLen; i++) {
+                float[] row = new float[96];  // 96 = embedding/feature dim
+                // Java initializes to 0.0f by default
+                updateFeatureQueue(row);
             }
+            warmupModels();
 
             extCarryLen = 0;
 
@@ -1046,7 +1044,6 @@ private float[][] getMelspectrogramForV2(short[] audioData) {
     }
 }
 
-    // v2: per-frame path – streaming mel, no embeddings, direct KWS ONNX
     private boolean processOneKwFrameV2(short[] frame, int frameLength) {
         try {
             // 1) update raw buffer (same as other paths)
@@ -1224,317 +1221,7 @@ public boolean predictFromExternalFullBuffer_v2(short[] pcm, int length) {
     }
 }
 
-    public boolean predictFromExternalFullBuffer_v1(short[] pcm, int length) {
-        if (!isListening || !isExternalMode.get() || pcm == null || length <= 0) return false;
-        boolean detected = false;
-        //Log.d(TAG, "predictFromExternalFullBuffer");
-
-        final int F = Constants.FRAME_LENGTH; // Changed to 1280/8
-        int offset = 0;//F * 7; // Skip first 6 frames ~ 500 ms
-
-        // === Add 200ms tail padding ===
-        final int padSamples = (Constants.SAMPLE_RATE * TAIL_PAD_MS) / 1000;
-
-        // // Merge any carried partial from previous call
-        // if (extCarryLen > 0) {
-        //     int need = F - extCarryLen;
-        //     int take = Math.min(need, length);
-        //     System.arraycopy(pcm, 0, extCarry, extCarryLen, take);
-        //     extCarryLen += take;
-        //     offset += take;
-
-        //     if (extCarryLen == F) {
-        //         try {
-        //             short[] merged = new short[length - offset + F];
-        //             System.arraycopy(extCarry, 0, merged, 0, F);
-        //             System.arraycopy(pcm, offset, merged, F, length - offset);
-        //             pcm = merged;
-        //             length = merged.length;
-        //             offset = 0;
-        //             extCarryLen = 0;
-        //         } catch (Throwable t) {
-        //             Log.e(TAG, "Failed to merge extCarry; processing immediately", t);
-        //             detected = processOneKwFrameNoCB(extCarry, F);
-
-        //             extCarryLen = 0;
-        //             if (detected) {
-        //                 return true;
-        //             }
-        //         }
-        //     }
-        // }
-        long t0 = tNow();
-        //Log.d(TAG, "Started predictFromExternalFullBuffer AT: " + t0);
-
-        // Decide head (bulk collect) size
-        int preSamples = 0;
-        if (bulkOptimizeEnabled && length - offset >= Math.max(bulkMinSamples, F * 2)) {
-            preSamples = (int)((length - offset) * bulkOptimizeRatio);
-            preSamples = (preSamples / F) * F;
-            preSamples = Math.min(Math.max(0, preSamples), Math.max(0, (length - offset) - F));
-        }
-        int headEnd = offset + preSamples;
-        //Log.d(TAG, "predictFromExternalFullBuffer 1 " + tMs(t0));
-
-        // === HEAD: mel + collect windows, no embeddings, no prediction
-        if (preSamples > 0) bulkCollecting = true;
-        //Log.d(TAG, "predictFromExternalFullBuffer 2 " + tMs(t0));
-
-        while (offset + F <= headEnd && isListening && isExternalMode.get()) {
-            short[] frame = new short[F];
-            System.arraycopy(pcm, offset, frame, 0, F);
-            //Log.d(TAG, "predictFromExternalFullBuffer 3 " + tMs(t0));
-            try {
-                //Log.d(TAG, "calling detectHeadCollect() with size " + F + " got to " + offset + F);
-
-                detectHeadCollect(frame);
-                storeFrame(frame, F);
-            } catch (Throwable e) {
-                Log.e(TAG, "head collect failed", e);
-            }
-            offset += F;
-        }
-
-        // === BOUNDARY: single batched embedding call for the head
-        if (bulkCollecting) {
-            try {
-                flushBulkEmbeddings(); // pushes head embeddings into featureDeque
-            } catch (Throwable e) {
-                Log.e(TAG, "flushBulkEmbeddings failed", e);
-            }
-            bulkCollecting = false;
-        }
-
-        // === TAIL: regular per-frame embedding + prediction
-        while (offset <= length + padSamples && isListening && isExternalMode.get()) {
-            short[] frame = new short[F];
-            // carry remainder
-            int take = Math.min(F, Math.max(0, length - offset));
-            if (take > 0) {
-                System.arraycopy(pcm, offset, frame, 0, take);
-            }
-
-            // if (offset + F > length) {
-            //     int remain = length - offset;
-            //     if (remain > 0) {
-            //         System.arraycopy(pcm, offset, frame, 0, remain);
-            //         System.arraycopy(zeroArr, 0, frame, remain, F - remain);
-            //     } else {
-            //         System.arraycopy(zeroArr, 0, frame, 0, F);
-            //     }
-            // } else {
-            //     System.arraycopy(pcm, offset, frame, 0, F);
-            // }
-            detected = processOneKwFrameNoCB(frame, F);
-            if (detected) {
-                Log.d(TAG, "predictFromExternalFullBuffer: Predicted after time: " + tMs(t0));
-                extCarryLen = 0;
-                return true;
-            }
-
-            offset += F;
-        }
-
-        // carry remainder
-        int remain = length - offset;
-        if (remain > 0) {
-            if (extCarry.length < F) extCarry = new short[F];
-            System.arraycopy(pcm, offset, extCarry, 0, remain);
-            extCarryLen = remain;
-        }
-        Log.d(TAG, "predictFromExternalFullBuffer: False reported after time: " + tMs(t0));
-        return false;
-    }
-
-    public void pushNextFrame(short[] pcm, int length) {
-        if (!isListening || !isExternalMode.get() || pcm == null || length <= 0) return;
-
-        final int F = Constants.FRAME_LENGTH; // 1280
-        int offset = 0;
-
-        // Merge any carried partial from previous call
-        if (extCarryLen > 0) {
-            int need = F - extCarryLen;
-            int take = Math.min(need, length);
-            System.arraycopy(pcm, 0, extCarry, extCarryLen, take);
-            extCarryLen += take;
-            offset += take;
-
-            if (extCarryLen == F) {
-                try {
-                    short[] merged = new short[length - offset + F];
-                    System.arraycopy(extCarry, 0, merged, 0, F);
-                    System.arraycopy(pcm, offset, merged, F, length - offset);
-                    pcm = merged;
-                    length = merged.length;
-                    offset = 0;
-                    extCarryLen = 0;
-                } catch (Throwable t) {
-                    Log.e(TAG, "Failed to merge extCarry; processing immediately", t);
-                    processOneKwFrame(extCarry, F, /*doPredict=*/true);
-                    extCarryLen = 0;
-                }
-            }
-        }
-
-        // Decide head (bulk collect) size
-        int preSamples = 0;
-        if (bulkOptimizeEnabled && length - offset >= Math.max(bulkMinSamples, F * 2)) {
-            preSamples = (int)((length - offset) * bulkOptimizeRatio);
-            preSamples = (preSamples / F) * F;
-            preSamples = Math.min(Math.max(0, preSamples), Math.max(0, (length - offset) - F));
-        }
-        int headEnd = offset + preSamples;
-
-        // === HEAD: mel + collect windows, no embeddings, no prediction
-        if (preSamples > 0) bulkCollecting = true;
-        while (offset + F <= headEnd && isListening && isExternalMode.get()) {
-            short[] frame = new short[F];
-            System.arraycopy(pcm, offset, frame, 0, F);
-            try {
-                detectHeadCollect(frame);
-                storeFrame(frame, F);
-            } catch (Throwable e) {
-                Log.e(TAG, "head collect failed", e);
-            }
-            offset += F;
-        }
-
-        // === BOUNDARY: single batched embedding call for the head
-        if (bulkCollecting) {
-            try {
-                flushBulkEmbeddings(); // pushes head embeddings into featureDeque
-            } catch (Throwable e) {
-                Log.e(TAG, "flushBulkEmbeddings failed", e);
-            }
-            bulkCollecting = false;
-        }
-
-        // === TAIL: regular per-frame embedding + prediction
-        while (offset + F <= length && isListening && isExternalMode.get()) {
-            short[] frame = new short[F];
-            System.arraycopy(pcm, offset, frame, 0, F);
-            processOneKwFrame(frame, F, /*doPredict=*/true);
-            offset += F;
-        }
-
-        // carry remainder
-        int remain = length - offset;
-        if (remain > 0) {
-            if (extCarry.length < F) extCarry = new short[F];
-            System.arraycopy(pcm, offset, extCarry, 0, remain);
-            extCarryLen = remain;
-        }
-    }
-
-    private boolean processOneKwFrameNoCB(short[] frame, int frameLength) {
-        boolean doPredict = true;
-        try {
-            // long t0 = tNow();
-            detectFromMicrophone(frame, /*computeEmbedding=*/doPredict, /*flushEmbedNow=*/doPredict);
-            storeFrame(frame, frameLength);
-            // //Log.d(TAG, "processOneKwFrameNoCB (detect+store): " + tMs(t0));
-
-            if (!doPredict) return false;
-
-            boolean allPredicted = true;
-
-            for (int i = 0; i < sessions.length; i++) {
-                //long tp = tNow();
-                float meanPrediction = predictFromBuffer(i);
-                //Log.d(TAG, "predict[" + strippedModelNames[i] + " value=" + meanPrediction);
-
-                if (meanPrediction > fakeThresholds[i]) {
-                    if (meanPrediction < keyThreasholds[i]) {
-                        //concurrentPredictions[i] = 0;
-                    } else {
-                        concurrentPredictions[i]++;
-                        if (concurrentPredictions[i] >= keyBufferCnts[i]) {
-                            long now = System.currentTimeMillis();
-                            if (lastCallbackInMS[i] + msBetweenCallbacks[i] <= now) {
-                                lastCallbackInMS[i] = now;
-                                String fileName = strippedModelNames[i] + "_prediction.wav";
-                                flushBufferToWav(fileName);
-                                // if (keywordDetectedCallback != null) {
-                                //     keywordDetectedCallback.accept(true, strippedModelNames[i]);
-                                // }
-
-                                // For single model
-                                // return true;
-                                for (int validate = 0; validate < sessions.length; validate++) {
-                                    if(concurrentPredictions[validate] < keyBufferCnts[validate])
-                                        allPredicted = false;
-                                }
-                                if (allPredicted) return true;
-                            }
-                            //concurrentPredictions[i] = 0;
-                        }
-                    }
-                } else {
-                    //concurrentPredictions[i] = 0;
-                }
-            }
-        } catch (Throwable fatal) {
-            Log.e(TAG, "processOneKwFrameNoCB (doPredict) failed – stopping detector", fatal);
-            stopListening();
-            return false;
-        }
-        return false;
-    }
-
-    private void processOneKwFrame(short[] frame, int frameLength) {
-        processOneKwFrame(frame, frameLength, /*doPredict=*/true);
-    }
-
-    private void processOneKwFrame(short[] frame, int frameLength, boolean doPredict) {
-        try {
-            // long t0 = tNow();
-            detectFromMicrophone(frame, /*computeEmbedding=*/doPredict, /*flushEmbedNow=*/doPredict);
-            storeFrame(frame, frameLength);
-            // //Log.d(TAG, "processOneKwFrame (detect+store): " + tMs(t0));
-
-            if (!doPredict) return;
-
-            for (int i = 0; i < sessions.length; i++) {
-                //long tp = tNow();
-                float meanPrediction = predictFromBuffer(i);
-                // //Log.d(TAG, "predict[" + strippedModelNames[i] + "] total: " + tMs(tp) + "  value=" + meanPrediction);
-
-                if (meanPrediction > fakeThresholds[i]) {
-                    if (meanPrediction < keyThreasholds[i]) {
-                        concurrentPredictions[i] = 0;
-                    } else {
-                        concurrentPredictions[i]++;
-                        if (concurrentPredictions[i] >= keyBufferCnts[i]) {
-                            long now = System.currentTimeMillis();
-                            if (lastCallbackInMS[i] + msBetweenCallbacks[i] <= now) {
-                                lastCallbackInMS[i] = now;
-                                String fileName = strippedModelNames[i] + "_prediction.wav";
-                                flushBufferToWav(fileName);
-                                if (keywordDetectedCallback != null) {
-                                    keywordDetectedCallback.accept(true, strippedModelNames[i]);
-                                }
-                            }
-                            concurrentPredictions[i] = 0;
-                        }
-                    }
-                } else {
-                    concurrentPredictions[i] = 0;
-                }
-            }
-        } catch (Throwable fatal) {
-            Log.e(TAG, "processOneKwFrame(doPredict) failed – stopping detector", fatal);
-            stopListening();
-        }
-    }
-
-    public boolean debug = false;
-
     public void startListening(float threshold) throws OrtException {
-        if (debug) {
-            testTwoRawAssets();
-            return;
-        }
 
         if (isListening) {
             //Log.d(TAG, "Already listening");
@@ -1549,16 +1236,6 @@ public boolean predictFromExternalFullBuffer_v2(short[] pcm, int length) {
             return;
         }
         isListening = false;
-
-        // Best-effort: flush any pending bulk windows before stopping
-        try {
-            if (!bulkWindows.isEmpty()) {
-                flushBulkEmbeddings();
-                bulkWindows.clear();
-            }
-        } catch (Throwable ignore) {}
-
-        //Log.d(TAG, "Stopping to listen");
 
         if (keyWordDetectionThread != null) {
             try {
@@ -1598,11 +1275,6 @@ public boolean predictFromExternalFullBuffer_v2(short[] pcm, int length) {
         bulkWindows.add(flattenedSubArray);
     }
 
-    private void flushBulkEmbeddings() throws OrtException {
-        if (bulkWindows.isEmpty()) return;
-        runEmbeddingBatch(bulkWindows); // pushes rows into featureDeque
-        bulkWindows.clear();
-    }
 
     private void streamingMelspectrogram(int nSamples) throws OrtException {
         //long t0 = tNow();
@@ -1981,61 +1653,6 @@ private static float[][] coerceByGuessingTF3D(float[][][] m3) {
         return squeezedBatch;
     }
 
-    private float[][] getEmbeddings(short[] audioData) throws OrtException {
-        //long t0 = tNow();
-        float[][] melspectrogram = getMelspectrogramShort(audioData);
-        int windowSize = 76;
-
-        List<float[][]> windows = extractWindows(melspectrogram, windowSize);
-
-        float[][][][] batch = expandDims(windows);
-        long[] shape = new long[]{windows.size(), 76, 32, 1};
-        float[][][] squeezedBatch = squeeze(batch);
-        OnnxTensor inputTensor = null;
-        OrtSession.Result result = null;
-
-        try {
-            //long tMake = tNow();
-            inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flatten3D(squeezedBatch)), shape);
-            embeddingInputsReusable.clear();
-            String embName = embeddingInputNames.iterator().next();
-            embeddingInputsReusable.put(embName, inputTensor);
-            // //Log.d(TAG, "embeddings make tensor (batch): " + tMs(tMake));
-
-            //long tRun = tNow();
-            result = embeddingSession.run(embeddingInputsReusable);
-            // //Log.d(TAG, "embeddingSession.run (batch): " + tMs(tRun));
-
-            float[][][][] outputTensor = (float[][][][]) result.get(0).getValue();
-
-            int dim0 = outputTensor.length;
-            int dim1 = outputTensor[0].length;
-            int dim2 = outputTensor[0][0].length;
-            int dim3 = outputTensor[0][0][0].length;
-
-            float[][] embeddings = new float[dim0][dim1 * dim2 * dim3];
-            for (int i = 0; i < dim0; i++) {
-                int index = 0;
-                for (int j = 0; j < dim1; j++) {
-                    for (int k = 0; k < dim2; k++) {
-                        for (int l = 0; l < dim3; l++) {
-                            embeddings[i][index++] = outputTensor[i][j][k][l];
-                        }
-                    }
-                }
-            }
-            // //Log.d(TAG, "getEmbeddings (batch) total: " + tMs(t0));
-            return embeddings;
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to run prediction session: " + e.getMessage());
-            return null;
-        } finally {
-            embeddingInputsReusable.clear();
-            if (result != null) result.close();
-            if (inputTensor != null) inputTensor.close();
-        }
-    }
-
     public int getNumberOfColumns() {
         return melspectrogramBuffer.isEmpty() ? 0 : melspectrogramBuffer.get(0).length;
     }
@@ -2064,111 +1681,7 @@ private static float[][] coerceByGuessingTF3D(float[][][] m3) {
         return flattenedArray;
     }
 
-    // MAIN detect (with optional embedding + optional immediate flush)
-    private float detectFromMicrophone(short[] audioData, boolean computeEmbedding, boolean flushEmbedNow) throws OrtException {
-        //long t0 = tNow();
-
-        //Log.d(TAG,"detectFromMicrophone()");
-        bufferRawData(audioData);
-        if (rawDataBuffer.size() < MIN_COLLECT_SAMPLES) {
-            //Log.d(TAG,"detectHeadCollect() rawDataBuffer.size() < MIN_COLLECT_SAMPLES");
-            // Not enough audio yet; keep accumulating
-            return 0.0f;
-        }
-
-        //long tMel = tNow();
-        streamingMelspectrogram(audioData.length);
-        // //Log.d(TAG, "streamingMelspectrogram (detectFromMicrophone): " + tMs(tMel));
-
-        if (!computeEmbedding) {
-            //Log.d(TAG, "detectFromMicrophone: skip embedding (head)");
-            // //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
-            return 0.0f;
-        }
-
-        int ndx = getMelNumberOfRows();
-        if (ndx < 76) {
-            //Log.d(TAG, "detectFromMicrophone: not enough mel rows yet");
-            // //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
-            return 0.0f;
-        }
-
-        float[][][][] melspectrogramSlice = getMelspecSubArray(ndx - 76, ndx);
-        float[][] flattenedSubArray = flattenSubArray(melspectrogramSlice);
-
-        // Single-window embedding (tail regular path)
-        // We push a batch of 1 immediately.
-        List<float[][]> one = new ArrayList<>(1);
-        one.add(flattenedSubArray);
-        runEmbeddingBatch(one); // this will push into featureDeque
-
-        // //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
-        return 0.0f;
-    }
-
-    // Back-compat entry point
-    public float detectFromMicrophone(short[] audioData) throws OrtException {
-        return detectFromMicrophone(audioData, /*computeEmbedding=*/true, /*flushEmbedNow=*/true);
-    }
-
-    // Batched embedding runner; pushes to feature queue
-    private void runEmbeddingBatch(List<float[][]> windows) throws OrtException {
-        if (windows == null || windows.isEmpty()) return;
-
-        //long tEmb = tNow();
-
-        float[][][][] batch4d = expandDims(windows);
-        float[][][] squeezed = squeeze(batch4d);
-        long[] shape = new long[]{windows.size(), 76, 32, 1};
-
-        OnnxTensor inputTensor = null;
-        OrtSession.Result result = null;
-        try {
-            //long tMake = tNow();
-            inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flatten3D(squeezed)), shape);
-            embeddingInputsReusable.clear();
-            String embName = embeddingInputNames.iterator().next();
-            embeddingInputsReusable.put(embName, inputTensor);
-
-            //long tRun = tNow();
-            result = embeddingSession.run(embeddingInputsReusable);
-
-            float[][][][] outputTensor = (float[][][][]) result.get(0).getValue();
-            int dim0 = outputTensor.length;
-            int dim1 = outputTensor[0].length;
-            int dim2 = outputTensor[0][0].length;
-            int dim3 = outputTensor[0][0][0].length;
-
-            for (int i = 0; i < dim0; i++) {
-                float[] row = new float[dim1 * dim2 * dim3];
-                int index = 0;
-                for (int j = 0; j < dim1; j++)
-                    for (int k = 0; k < dim2; k++)
-                        for (int l = 0; l < dim3; l++)
-                            row[index++] = outputTensor[i][j][k][l];
-                updateFeatureQueue(row);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "runEmbeddingBatch failed: " + e.getMessage());
-        } finally {
-            embeddingInputsReusable.clear();
-            if (result != null) result.close();
-            if (inputTensor != null) inputTensor.close();
-        }
-    }
-
     private void updateFeatureQueue(float[] newRow) {
-        if (featureDeque.size() >= featureBufferMaxLen) {
-            featureDeque.removeFirst();
-        }
-        featureDeque.addLast(newRow);
-    }
-
-    private void updateFeatureQueue(float[][] embedding) {
-        if (embedding == null || embedding.length == 0) {
-            return;
-        }
-        float[] newRow = embedding[0];
         if (featureDeque.size() >= featureBufferMaxLen) {
             featureDeque.removeFirst();
         }
@@ -2193,51 +1706,6 @@ private static float[][] coerceByGuessingTF3D(float[][][] m3) {
         return flattened;
     }
 
-    private float predictFromBuffer(int model_i) {
-        //long t0 = tNow();
-        if (featureDeque.size() < nFeatureFrames[model_i]) {
-            return 0.0f;
-        }
-
-        //long tPack = tNow();
-        float[][] features = new float[nFeatureFrames[model_i]][96];
-
-        float[][] buf = featureDeque.toArray(new float[featureDeque.size()][]);
-        System.arraycopy(buf, buf.length - nFeatureFrames[model_i],
-            features, 0, nFeatureFrames[model_i]);
-
-        float[] flattenedFeatures = flatten(features);
-
-        OnnxTensor inputTensor = null;
-        OrtSession.Result result = null;
-        Map<String, OnnxTensor> inputs = null;
-        try {
-            //long tMake = tNow();
-            long[] shape = new long[]{1, nFeatureFrames[model_i], 96};
-            inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flattenedFeatures), shape);
-            inputs = new HashMap<>();
-            inputs.put(inputNames[model_i].get(0), inputTensor);
-
-            //long tRun = tNow();
-            result = sessions[model_i].run(inputs);
-
-            float[][] outputData2D = (float[][]) result.get(0).getValue();
-            float prediction = outputData2D[0][0];
-            return prediction;
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to run prediction session: " + e.getMessage());
-            return 0.0f;
-        } finally {
-            features = null;
-            if (inputs != null)
-                inputs.remove(inputNames[model_i].get(0));
-            inputs = null;
-            flattenedFeatures = null;
-            if (result != null) result.close();
-            if (inputTensor != null) inputTensor.close();
-        }
-    }
-
     private float[] flatten(float[][] array) {
         int size = 0;
         for (float[] subArray : array) {
@@ -2250,57 +1718,6 @@ private static float[][] coerceByGuessingTF3D(float[][][] m3) {
             index += subArray.length;
         }
         return flattened;
-    }
-
-    private float[][] getEmbeddingsFromMelspectrogram(float[][] melspectrogram) throws OrtException {
-        //long t0 = tNow();
-        long[] shape = new long[]{1, 76, 32, 1};
-        String embInputName = null;
-        OrtSession.Result result = null;
-        OnnxTensor inputTensor = null;
-        Map<String, OnnxTensor> inputs = null;
-        try {
-            //long tFlat = tNow();
-            float[] flattenedMelspectrogram = flatten4D(new float[][][][]{new float[][][]{melspectrogram}});
-
-            inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flattenedMelspectrogram), shape);
-            inputs = new HashMap<>();
-            embInputName = embeddingInputNames.iterator().next();
-            inputs.put(embInputName, inputTensor);
-
-            //long tRun = tNow();
-            result = embeddingSession.run(inputs);
-
-            float[][][][] outputTensor = (float[][][][]) result.get(0).getValue();
-
-            int dim0 = outputTensor.length;
-            int dim1 = outputTensor[0].length;
-            int dim2 = outputTensor[0][0].length;
-            int dim3 = outputTensor[0][0][0].length;
-
-            float[][] embeddings = new float[dim0][dim1 * dim2 * dim3];
-            for (int i = 0; i < dim0; i++) {
-                int index = 0;
-                for (int j = 0; j < dim1; j++) {
-                    for (int k = 0; k < dim2; k++) {
-                        for (int l = 0; l < dim3; l++) {
-                            embeddings[i][index++] = outputTensor[i][j][k][l];
-                        }
-                    }
-                }
-            }
-            return embeddings;
-        } catch (Exception e) {
-            Log.e(TAG, "getEmbeddingsFromMelspectrogram failed: " + e.getMessage());
-            return null;
-        } finally {
-            if (inputs != null) inputs.remove(embInputName);
-            embInputName = null;
-            inputs = null;
-            if (result != null) result.close();
-            if (inputTensor != null) inputTensor.close();
-        }
-
     }
 
     private float[] flatten4D(float[][][][] array) {
@@ -2462,74 +1879,6 @@ private static float[][] coerceByGuessingTF3D(float[][][] m3) {
         return null;
     }
 
-    private String expandDmReturnFirstOnnxIfNeeded(String packedPath) {
-        if (packedPath == null) return null;
-        if (packedPath.endsWith(".onnx")) return packedPath;
-
-        File dmFile = new File(packedPath);
-        if (!dmFile.exists()) return packedPath;
-
-        File outDir = new File(context.getFilesDir(),
-                "dm_unpack_" + dmFile.getName().replaceAll("[^A-Za-z0-9._-]", "_"));
-        if (!outDir.exists() && !outDir.mkdirs()) return packedPath;
-
-        try {
-            byte[] all = readAllBytes(packedPath);
-            byte[] delim = DM_DELIM.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            List<int[]> ranges = splitByDelimiter(all, delim);
-            for (int[] r : ranges) {
-                extractTarFromBuffer(all, r[0], r[1], outDir);
-            }
-            File onnx = findFirstFileWithExtension(outDir, ".onnx");
-            return (onnx != null && onnx.exists()) ? onnx.getAbsolutePath() : packedPath;
-        } catch (Exception e) {
-            return packedPath;
-        }
-    }
-
-    private Map<String, String> expandDmAndPick(String dmPath, String... exactNames) {
-        Map<String, String> out = new HashMap<>();
-        if (dmPath == null) return out;
-        File dmFile = new File(dmPath);
-        if (!dmFile.exists()) return out;
-
-        File outDir = new File(context.getFilesDir(),
-                "dm_unpack_" + dmFile.getName().replaceAll("[^A-Za-z0-9._-]", "_"));
-        if (!outDir.exists()) outDir.mkdirs();
-
-        try {
-            byte[] all = readAllBytes(dmPath);
-            byte[] delim = DM_DELIM.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            List<int[]> ranges = splitByDelimiter(all, delim);
-            for (int[] r : ranges) extractTarFromBuffer(all, r[0], r[1], outDir);
-
-            for (String name : exactNames) {
-                File f = findFileByExactName(outDir, name);
-                if (f != null && f.exists()) out.put(name, f.getAbsolutePath());
-            }
-            return out;
-        } catch (Exception e) {
-            return out;
-        }
-    }
-
-    private String[] extractLayer1IfPresent() {
-        final String dmAsset = "layer1.dm";
-        if (!assetExists(dmAsset)) return null;
-
-        String dmPath = copyAssetToInternalStorage(dmAsset);
-        Map<String, String> pick = expandDmAndPick(dmPath,
-                "melspectrogram.onnx", "embedding_model.onnx", "silero_vad.onnx");
-
-        String m = pick.get("melspectrogram.onnx");
-        String e = pick.get("embedding_model.onnx");
-        String v = pick.get("silero_vad.onnx");
-
-        if (m != null && e != null && v != null) {
-            return new String[]{m, e, v};
-        }
-        return null;
-    }
 
     public Map<String, Object> getVoiceProps() {
         Map<String, Object> result = new HashMap<>();
@@ -2618,84 +1967,5 @@ private static float[][] coerceByGuessingTF3D(float[][][] m3) {
         int samples = getAssetSampleCount(assetName);
         return samples / 16000.0;
     }
-
-    public void runExternalOnRawAsset_AllAtOnce(String assetName, boolean skipFirst2s) {
-        try {
-            if (!isListening || !isExternalMode.get()) {
-                startListeningExternalAudio(/*threshold*/ 0.0f);
-            }
-            short[] pcm = readPcm16LeRawAsset(assetName);
-
-            int offsetSamples = skipFirst2s ? (2 * 16000) : 0;
-            if (offsetSamples < 0) offsetSamples = 0;
-            if (offsetSamples > pcm.length) offsetSamples = pcm.length;
-
-            if (offsetSamples == 0) {
-                pushNextFrame(pcm, pcm.length);
-            } else {
-                int remain = pcm.length - offsetSamples;
-                short[] tail = new short[remain];
-                System.arraycopy(pcm, offsetSamples, tail, 0, remain);
-                pushNextFrame(tail, tail.length);
-            }
-            //Log.d(TAG, "runExternalOnRawAsset_AllAtOnce(): pushed '" + assetName + "', samples=" + pcm.length);
-        } catch (Throwable e) {
-            Log.e(TAG, "runExternalOnRawAsset_AllAtOnce failed for " + assetName, e);
-            stopListening();
-        }
-    }
-    
-    public void runExternalOnRawAsset_Stream(String assetName, boolean skipFirst2s) {
-        final int F = Constants.FRAME_LENGTH;
-        AssetManager am = context.getAssets();
-
-        try (InputStream in = am.open(assetName);
-             BufferedInputStream bis = new BufferedInputStream(in)) {
-
-            if (!isListening || !isExternalMode.get()) {
-                startListeningExternalAudio(/*threshold*/ 0.0f);
-            }
-
-            int toSkipBytes = skipFirst2s ? (2 * 16000 * 2) : 0;
-            while (toSkipBytes > 0) {
-                long skipped = bis.skip(toSkipBytes);
-                if (skipped <= 0) break;
-                toSkipBytes -= skipped;
-            }
-
-            byte[] b = new byte[F * 2];
-            for (;;) {
-                int off = 0, n;
-                while (off < b.length && (n = bis.read(b, off, b.length - off)) > 0) off += n;
-                if (off <= 0) break;
-
-                int samples = off / 2;
-                short[] chunk = new short[samples];
-                for (int i = 0, s = 0; i + 1 < off; i += 2, s++) {
-                    int lo = (b[i] & 0xFF);
-                    int hi = (b[i + 1] << 8);
-                    chunk[s] = (short)(hi | lo);
-                }
-                pushNextFrame(chunk, chunk.length);
-
-                if (off < b.length) break;
-            }
-            //Log.d(TAG, "runExternalOnRawAsset_Stream(): streamed '" + assetName + "'");
-        } catch (Throwable e) {
-            Log.e(TAG, "runExternalOnRawAsset_Stream failed for " + assetName, e);
-            stopListening();
-        }
-    }
-
-    public void testTwoRawAssets() {
-        startListeningExternalAudio(/*threshold*/ 0.0f);
-
-        runExternalOnRawAsset_AllAtOnce("audio_1758288269102.raw", /*skipFirst2s*/ false);
-        //runExternalOnRawAsset_AllAtOnce("blabla.raw", false);
-
-        // runExternalOnRawAsset_Stream("audio_1758288269102.raw", true);
-        // runExternalOnRawAsset_Stream("blabla.raw", true);
-    }
-    // END OF TEST CODE
 
 }
