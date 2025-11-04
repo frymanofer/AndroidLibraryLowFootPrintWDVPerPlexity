@@ -61,7 +61,7 @@ public class KeyWordsDetection {
     private Set<String> melspecInputNames;
     private static final int MEL_SPECTROGRAM_MAX_LEN = 10 * 97;
     private static final int SAMPLE_RATE = 16000; // currently
-    private static final int RAW_BUFFER_MAX_LEN = Constants.FRAME_LENGTH * 2;
+    private static final int RAW_BUFFER_MAX_LEN = (1280 * 2);
     private final int featureBufferMaxLen = 120;
     private Deque<float[]> featureDeque = new ArrayDeque<>();
 
@@ -73,6 +73,7 @@ public class KeyWordsDetection {
     private float[] fakeThresholds;
     private BiConsumer<Boolean, String> keywordDetectedCallback;
     private int[] concurrentPredictions;
+    private int[] perModellPredictions;
     private long[] lastCallbackInMS;
 
     private int bufferPosition = 0;
@@ -85,6 +86,7 @@ public class KeyWordsDetection {
     private boolean isSticky = true;
     private static int randomDataSize = 16000 * 4;
     private short[] randomData = new short[randomDataSize];
+    private short[] zeroArr = new short[Constants.FRAME_LENGTH * 2];
 
     private Thread keyWordDetectionThread = null;
     private Thread VADThread = null;
@@ -121,7 +123,7 @@ public class KeyWordsDetection {
     static {
         try {
             System.loadLibrary("onnxruntime");
-            Log.d("KeyWordsDetection", "onnxruntime loaded successfully.");
+            //Log.d("KeyWordsDetection", "onnxruntime loaded successfully.");
         } catch (UnsatisfiedLinkError e) {
             Log.w("KeyWordsDetection", "Native library not found or symbol missing: " + e.getMessage(), e);
         } catch (SecurityException e) {
@@ -133,7 +135,7 @@ public class KeyWordsDetection {
         }
         try {
             System.loadLibrary("onnxruntime4j_jni");
-            Log.d("KeyWordsDetection", "onnxruntime4j_jni loaded successfully.");
+            //Log.d("KeyWordsDetection", "onnxruntime4j_jni loaded successfully.");
         } catch (UnsatisfiedLinkError e) {
             Log.w("KeyWordsDetection", "Native library not found or symbol missing: " + e.getMessage(), e);
         } catch (SecurityException e) {
@@ -153,7 +155,7 @@ public class KeyWordsDetection {
                             long[] msBetweenCallback)
             throws OrtException, SecurityException {
 
-        Log.d(TAG, "KeyWordsDetection new constructor: ");
+        //Log.d(TAG, "KeyWordsDetection new constructor: ");
         this.keyThreasholds = thresholds;
         this.keyBufferCnts = bufferCnts;
         this.msBetweenCallbacks = msBetweenCallback;
@@ -162,18 +164,21 @@ public class KeyWordsDetection {
         fakeThresholds = new float[numModels];
         lastCallbackInMS = new long[numModels];
         concurrentPredictions = new int[numModels];
+        perModellPredictions = new int[numModels];
         for (int i = 0; i < numModels; i++) {
             fakeThresholds[i] = thresholds[i] - 0.1f;
             lastCallbackInMS[i] = 0;
             concurrentPredictions[i] = 0;
+            perModellPredictions[i] = 0;
         }
 
-        Log.d(TAG, "KeyWordsDetection constructor: keyThreasholds: " + keyThreasholds);
-        Log.d(TAG, "KeyWordsDetection constructor: fakeThresholds: " + fakeThresholds);
+        //Log.d(TAG, "KeyWordsDetection constructor: keyThreasholds: " + keyThreasholds);
+        //Log.d(TAG, "KeyWordsDetection constructor: fakeThresholds: " + fakeThresholds);
         audioBuffer = new short[LAST_SEC_BUFF_SIZE];
         Arrays.fill(audioBuffer, (short) 0);
 
-        Log.d(TAG, "KeyWordsDetection constructor: keyBufferCnts: " + keyBufferCnts);
+        Arrays.fill(zeroArr, (short) 0);
+        //Log.d(TAG, "KeyWordsDetection constructor: keyBufferCnts: " + keyBufferCnts);
         inputs = new HashMap<>();
 
         this.context = context;
@@ -215,7 +220,7 @@ public class KeyWordsDetection {
         }
 
         try {
-            Log.d(TAG, "KeyWordsDetection constructor: Models: " + Arrays.toString(modelPaths));
+            //Log.d(TAG, "KeyWordsDetection constructor: Models: " + Arrays.toString(modelPaths));
             env = OrtEnvironment.getEnvironment();
             OrtSession.SessionOptions options = new OrtSession.SessionOptions();
 
@@ -240,7 +245,8 @@ public class KeyWordsDetection {
             }
 
             options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-            options.setIntraOpNumThreads(Math.min(4, cores));
+//            options.setIntraOpNumThreads(Math.min(2, cores)); Best????
+            options.setIntraOpNumThreads(Math.min(2, cores)); 
             options.setInterOpNumThreads(1);
             options.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.PARALLEL);
             options.setCPUArenaAllocator(true);
@@ -266,7 +272,7 @@ public class KeyWordsDetection {
                 TensorInfo tensorInfo = (TensorInfo) inputInfo.getInfo();
                 long[] shape = tensorInfo.getShape();
                 nFeatureFrames[i] = (int) shape[1];
-                Log.d(TAG, "Model [" + strippedModelNames[i] + "] nFeatureFrames: " + nFeatureFrames[i]);
+                //Log.d(TAG, "Model [" + strippedModelNames[i] + "] nFeatureFrames: " + nFeatureFrames[i]);
             }
             if (melspectrogramBuffer != null)
                 melspectrogramBuffer.clear();
@@ -287,10 +293,7 @@ public class KeyWordsDetection {
             else
                 featureDeque = new ArrayDeque<>();
 
-            Random rand = new Random();
-            for (int i = 0; i < randomDataSize; i++) {
-                randomData[i] = (short) (rand.nextInt(2000) - 1000);
-            }
+            randomData = new short[randomDataSize]; // zeroes!!!
             featureDeque.clear();
             float[][] randomEmbeds = getEmbeddings(randomData);
             if (randomEmbeds != null) {
@@ -306,7 +309,7 @@ public class KeyWordsDetection {
 
 
     public void close() {
-        Log.d(TAG, "KeyWordsDetection close() called, cleaning up all native resources.");
+        //Log.d(TAG, "KeyWordsDetection close() called, cleaning up all native resources.");
 
         stopListening();
 
@@ -344,7 +347,7 @@ public class KeyWordsDetection {
         rawDataBuffer = null;
 
         isListening = false;
-        Log.d(TAG, "KeyWordsDetection close() completed.");
+        //Log.d(TAG, "KeyWordsDetection close() completed.");
     }
 
     public String getKeywordDetectionModel() {
@@ -363,10 +366,10 @@ public class KeyWordsDetection {
         for (String dir : possibleDirs) {
             File file = new File(dir, fileName);
             if (file.exists()) {
-                Log.d("File Search", "File found: " + file.getAbsolutePath());
+                //Log.d("File Search", "File found: " + file.getAbsolutePath());
                 return copyFileToExternalStorage(file.getAbsolutePath());
             } else {
-                Log.d("File Search", "File not found in: " + dir);
+                //Log.d("File Search", "File not found in: " + dir);
             }
         }
 
@@ -410,7 +413,7 @@ public class KeyWordsDetection {
             }
             in.close();
             out.close();
-            Log.d("copyFileToExternal", "File copied to: " + destFile.getAbsolutePath());
+            //Log.d("copyFileToExternal", "File copied to: " + destFile.getAbsolutePath());
             return destFile.getAbsolutePath();
         } catch (IOException e) {
             Log.e("copyFileToExternal", "Error copying file: " + e.getMessage());
@@ -444,7 +447,7 @@ public class KeyWordsDetection {
 
     public void replaceKeywordDetectionModel(Context context, String[] modelPaths, float[] thresholds, int[] bufferCnts, long[] msBetweenCallback)
         throws OrtException, SecurityException {
-        Log.d(TAG, "replaceKeywordDetectionModel()");
+        //Log.d(TAG, "replaceKeywordDetectionModel()");
         this.keyThreasholds = thresholds;
         this.keyBufferCnts = bufferCnts;
         this.msBetweenCallbacks = msBetweenCallback;
@@ -497,7 +500,7 @@ public class KeyWordsDetection {
         }
 
         try {
-            Log.d(TAG, "KeyWordsDetection constructor: Models: " + Arrays.toString(modelPaths));
+            //Log.d(TAG, "KeyWordsDetection constructor: Models: " + Arrays.toString(modelPaths));
             env = OrtEnvironment.getEnvironment();
             OrtSession.SessionOptions options = new OrtSession.SessionOptions();
             options.setInterOpNumThreads(1);
@@ -511,7 +514,7 @@ public class KeyWordsDetection {
                 TensorInfo tensorInfo = (TensorInfo) inputInfo.getInfo();
                 long[] shape = tensorInfo.getShape();
                 nFeatureFrames[i] = (int) shape[1];
-                Log.d(TAG, "Model [" + strippedModelNames[i] + "] nFeatureFrames: " + nFeatureFrames[i]);
+                //Log.d(TAG, "Model [" + strippedModelNames[i] + "] nFeatureFrames: " + nFeatureFrames[i]);
             }
 
         } catch (OrtException e) {
@@ -534,7 +537,7 @@ public class KeyWordsDetection {
 
         if (file.exists()) {
             boolean deleted = file.delete();
-            Log.d(TAG, "Existing asset deleted: " + deleted);
+            //Log.d(TAG, "Existing asset deleted: " + deleted);
         }
 
         if (!file.exists()) {
@@ -576,7 +579,7 @@ public class KeyWordsDetection {
 
     public void flushBufferToWav(String fileName) throws IOException {
         File file = new File(context.getFilesDir(), fileName);
-        Log.d(TAG, "Saving WAV file: " + fileName);
+        //Log.d(TAG, "Saving WAV file: " + fileName);
 
         try (FileOutputStream fos = new FileOutputStream(file);
              ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -611,7 +614,7 @@ public class KeyWordsDetection {
 
             fos.write(baos.toByteArray());
             lastFile = fileName;
-            Log.d(TAG, "lastFile: " + lastFile);
+            //Log.d(TAG, "lastFile: " + lastFile);
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -627,9 +630,10 @@ public class KeyWordsDetection {
 
     public void startListeningExternalAudio(float threshold) {
         if (isListening) {
-            Log.d(TAG, "Already listening");
+            //Log.d(TAG, "Already listening");
             return;
         }
+        Arrays.fill(zeroArr, (short) 0);
 
         try {
             isListening = true;
@@ -661,10 +665,7 @@ public class KeyWordsDetection {
             bulkWindows.clear();
             bulkCollecting = false;
 
-            Random rand = new Random();
-            for (int i = 0; i < randomDataSize; i++) {
-                randomData[i] = (short) (rand.nextInt(2000) - 1000);
-            }
+            randomData = new short[randomDataSize]; // zeroes!!!
             featureDeque.clear();
             float[][] randomEmbeds = getEmbeddings(randomData);
             if (randomEmbeds != null) {
@@ -675,9 +676,9 @@ public class KeyWordsDetection {
 
             extCarryLen = 0;
 
-            Log.d(TAG, "startListeningExternalAudio(): init complete");
-            Log.d(TAG, "keyThreasholds: " + Arrays.toString(keyThreasholds));
-            Log.d(TAG, "fakeThresholds: " + Arrays.toString(fakeThresholds));
+            //Log.d(TAG, "startListeningExternalAudio(): init complete");
+            //Log.d(TAG, "keyThreasholds: " + Arrays.toString(keyThreasholds));
+            //Log.d(TAG, "fakeThresholds: " + Arrays.toString(fakeThresholds));
         } catch (Throwable fatal) {
             Log.e(TAG, "startListeningExternalAudio failed – shutting detector down", fatal);
             stopListening();
@@ -692,44 +693,51 @@ public class KeyWordsDetection {
     }
     
     public void setBulkMinSamples(int samples) {
-        bulkMinSamples = Math.max(Constants.FRAME_LENGTH * 2, samples);
+        bulkMinSamples = Math.max(1280 * 2, samples);
     }
 
     public boolean predictFromExternalFullBuffer(short[] pcm, int length) {
         if (!isListening || !isExternalMode.get() || pcm == null || length <= 0) return false;
         boolean detected = false;
+        //Log.d(TAG, "predictFromExternalFullBuffer");
 
-        final int F = Constants.FRAME_LENGTH; // 1280
-        int offset = 0;
+        final int F = Constants.FRAME_LENGTH; // Changed to 1280/8
+        int offset = 0;//F * 7; // Skip first 6 frames ~ 500 ms
 
-        // Merge any carried partial from previous call
-        if (extCarryLen > 0) {
-            int need = F - extCarryLen;
-            int take = Math.min(need, length);
-            System.arraycopy(pcm, 0, extCarry, extCarryLen, take);
-            extCarryLen += take;
-            offset += take;
+        // === Add 200ms tail padding ===
+        final int PAD_MS = 1000;
+        final int padSamples = (Constants.SAMPLE_RATE * PAD_MS) / 1000;
 
-            if (extCarryLen == F) {
-                try {
-                    short[] merged = new short[length - offset + F];
-                    System.arraycopy(extCarry, 0, merged, 0, F);
-                    System.arraycopy(pcm, offset, merged, F, length - offset);
-                    pcm = merged;
-                    length = merged.length;
-                    offset = 0;
-                    extCarryLen = 0;
-                } catch (Throwable t) {
-                    Log.e(TAG, "Failed to merge extCarry; processing immediately", t);
-                    detected = processOneKwFrameNoCB(extCarry, F);
+        // // Merge any carried partial from previous call
+        // if (extCarryLen > 0) {
+        //     int need = F - extCarryLen;
+        //     int take = Math.min(need, length);
+        //     System.arraycopy(pcm, 0, extCarry, extCarryLen, take);
+        //     extCarryLen += take;
+        //     offset += take;
 
-                    extCarryLen = 0;
-                    if (detected) {
-                        return true;
-                    }
-                }
-            }
-        }
+        //     if (extCarryLen == F) {
+        //         try {
+        //             short[] merged = new short[length - offset + F];
+        //             System.arraycopy(extCarry, 0, merged, 0, F);
+        //             System.arraycopy(pcm, offset, merged, F, length - offset);
+        //             pcm = merged;
+        //             length = merged.length;
+        //             offset = 0;
+        //             extCarryLen = 0;
+        //         } catch (Throwable t) {
+        //             Log.e(TAG, "Failed to merge extCarry; processing immediately", t);
+        //             detected = processOneKwFrameNoCB(extCarry, F);
+
+        //             extCarryLen = 0;
+        //             if (detected) {
+        //                 return true;
+        //             }
+        //         }
+        //     }
+        // }
+        long t0 = tNow();
+        //Log.d(TAG, "Started predictFromExternalFullBuffer AT: " + t0);
 
         // Decide head (bulk collect) size
         int preSamples = 0;
@@ -739,13 +747,19 @@ public class KeyWordsDetection {
             preSamples = Math.min(Math.max(0, preSamples), Math.max(0, (length - offset) - F));
         }
         int headEnd = offset + preSamples;
+        //Log.d(TAG, "predictFromExternalFullBuffer 1 " + tMs(t0));
 
         // === HEAD: mel + collect windows, no embeddings, no prediction
         if (preSamples > 0) bulkCollecting = true;
+        //Log.d(TAG, "predictFromExternalFullBuffer 2 " + tMs(t0));
+
         while (offset + F <= headEnd && isListening && isExternalMode.get()) {
             short[] frame = new short[F];
             System.arraycopy(pcm, offset, frame, 0, F);
+            //Log.d(TAG, "predictFromExternalFullBuffer 3 " + tMs(t0));
             try {
+                //Log.d(TAG, "calling detectHeadCollect() with size " + F + " got to " + offset + F);
+
                 detectHeadCollect(frame);
                 storeFrame(frame, F);
             } catch (Throwable e) {
@@ -765,11 +779,28 @@ public class KeyWordsDetection {
         }
 
         // === TAIL: regular per-frame embedding + prediction
-        while (offset + F <= length && isListening && isExternalMode.get()) {
+        while (offset <= length + padSamples && isListening && isExternalMode.get()) {
             short[] frame = new short[F];
-            System.arraycopy(pcm, offset, frame, 0, F);
+            // carry remainder
+            int take = Math.min(F, Math.max(0, length - offset));
+            if (take > 0) {
+                System.arraycopy(pcm, offset, frame, 0, take);
+            }
+
+            // if (offset + F > length) {
+            //     int remain = length - offset;
+            //     if (remain > 0) {
+            //         System.arraycopy(pcm, offset, frame, 0, remain);
+            //         System.arraycopy(zeroArr, 0, frame, remain, F - remain);
+            //     } else {
+            //         System.arraycopy(zeroArr, 0, frame, 0, F);
+            //     }
+            // } else {
+            //     System.arraycopy(pcm, offset, frame, 0, F);
+            // }
             detected = processOneKwFrameNoCB(frame, F);
             if (detected) {
+                Log.d(TAG, "predictFromExternalFullBuffer: Predicted after time: " + tMs(t0));
                 extCarryLen = 0;
                 return true;
             }
@@ -784,6 +815,7 @@ public class KeyWordsDetection {
             System.arraycopy(pcm, offset, extCarry, 0, remain);
             extCarryLen = remain;
         }
+        Log.d(TAG, "predictFromExternalFullBuffer: False reported after time: " + tMs(t0));
         return false;
     }
 
@@ -874,18 +906,20 @@ public class KeyWordsDetection {
             // long t0 = tNow();
             detectFromMicrophone(frame, /*computeEmbedding=*/doPredict, /*flushEmbedNow=*/doPredict);
             storeFrame(frame, frameLength);
-            // Log.d(TAG, "processOneKwFrameNoCB (detect+store): " + tMs(t0));
+            // //Log.d(TAG, "processOneKwFrameNoCB (detect+store): " + tMs(t0));
 
             if (!doPredict) return false;
+
+            boolean allPredicted = true;
 
             for (int i = 0; i < sessions.length; i++) {
                 //long tp = tNow();
                 float meanPrediction = predictFromBuffer(i);
-                //Log.d(TAG, "predict[" + strippedModelNames[i] + "] total: " + tMs(tp) + "  value=" + meanPrediction);
+                //Log.d(TAG, "predict[" + strippedModelNames[i] + " value=" + meanPrediction);
 
                 if (meanPrediction > fakeThresholds[i]) {
                     if (meanPrediction < keyThreasholds[i]) {
-                        concurrentPredictions[i] = 0;
+                        //concurrentPredictions[i] = 0;
                     } else {
                         concurrentPredictions[i]++;
                         if (concurrentPredictions[i] >= keyBufferCnts[i]) {
@@ -894,16 +928,23 @@ public class KeyWordsDetection {
                                 lastCallbackInMS[i] = now;
                                 String fileName = strippedModelNames[i] + "_prediction.wav";
                                 flushBufferToWav(fileName);
-                                if (keywordDetectedCallback != null) {
-                                    keywordDetectedCallback.accept(true, strippedModelNames[i]);
+                                // if (keywordDetectedCallback != null) {
+                                //     keywordDetectedCallback.accept(true, strippedModelNames[i]);
+                                // }
+
+                                // For single model
+                                // return true;
+                                for (int validate = 0; validate < sessions.length; validate++) {
+                                    if(concurrentPredictions[validate] < keyBufferCnts[validate])
+                                        allPredicted = false;
                                 }
-                                return true;
+                                if (allPredicted) return true;
                             }
-                            concurrentPredictions[i] = 0;
+                            //concurrentPredictions[i] = 0;
                         }
                     }
                 } else {
-                    concurrentPredictions[i] = 0;
+                    //concurrentPredictions[i] = 0;
                 }
             }
         } catch (Throwable fatal) {
@@ -923,14 +964,14 @@ public class KeyWordsDetection {
             // long t0 = tNow();
             detectFromMicrophone(frame, /*computeEmbedding=*/doPredict, /*flushEmbedNow=*/doPredict);
             storeFrame(frame, frameLength);
-            // Log.d(TAG, "processOneKwFrame (detect+store): " + tMs(t0));
+            // //Log.d(TAG, "processOneKwFrame (detect+store): " + tMs(t0));
 
             if (!doPredict) return;
 
             for (int i = 0; i < sessions.length; i++) {
                 //long tp = tNow();
                 float meanPrediction = predictFromBuffer(i);
-                //Log.d(TAG, "predict[" + strippedModelNames[i] + "] total: " + tMs(tp) + "  value=" + meanPrediction);
+                // //Log.d(TAG, "predict[" + strippedModelNames[i] + "] total: " + tMs(tp) + "  value=" + meanPrediction);
 
                 if (meanPrediction > fakeThresholds[i]) {
                     if (meanPrediction < keyThreasholds[i]) {
@@ -969,7 +1010,7 @@ public class KeyWordsDetection {
         }
 
         if (isListening) {
-            Log.d(TAG, "Already listening");
+            //Log.d(TAG, "Already listening");
             return;
         }
         Log.e(TAG, "Start Listening with Mic not implemented!!!");
@@ -977,7 +1018,7 @@ public class KeyWordsDetection {
 
     public void stopListening() {
         if (!isListening) {
-            Log.d(TAG, "Stop listening is called while not listening.");
+            //Log.d(TAG, "Stop listening is called while not listening.");
             return;
         }
         isListening = false;
@@ -990,7 +1031,7 @@ public class KeyWordsDetection {
             }
         } catch (Throwable ignore) {}
 
-        Log.d(TAG, "Stopping to listen");
+        //Log.d(TAG, "Stopping to listen");
 
         if (keyWordDetectionThread != null) {
             try {
@@ -1007,9 +1048,17 @@ public class KeyWordsDetection {
     }
 
     // ===== Bulk head helpers =====
+    private static final int MIN_COLLECT_SAMPLES = 1280;
 
     private void detectHeadCollect(short[] audioData) throws OrtException {
+        //Log.d(TAG,"detectHeadCollect()");
         bufferRawData(audioData);
+        if (rawDataBuffer.size() < MIN_COLLECT_SAMPLES) {
+            //Log.d(TAG,"detectHeadCollect() rawDataBuffer.size() < MIN_COLLECT_SAMPLES");
+            // Not enough audio yet; keep accumulating
+            return;
+        }
+
         streamingMelspectrogram(audioData.length); // updates mel buffer
         collectBulkWindowFromLatestMel();          // queue 76x32 into bulkWindows
     }
@@ -1051,7 +1100,7 @@ public class KeyWordsDetection {
 
         float[][] melspec = getMelspectrogramShort(rawData);
         updateMelspectrogramBuffer(melspec);
-        //Log.d(TAG, "streamingMelspectrogram: " + tMs(t0) + " (nSamples=" + nSamples + ", raw=" + rawData.length + ")");
+        // //Log.d(TAG, "streamingMelspectrogram: " + tMs(t0) + " (nSamples=" + nSamples + ", raw=" + rawData.length + ")");
     }
 
     public void appendMelspec(float[][] melspec) {
@@ -1156,8 +1205,155 @@ public class KeyWordsDetection {
         return transformedArray;
     }
 
+// Normalize ONNX mel output to 2D [T, F] without OnnxTensor casts (Java 8)
+private static float[][] coerceMelTo2D(Object v) {
+    if (v instanceof float[][]) {
+        return (float[][]) v;
+    } else if (v instanceof float[][][]) {
+        float[][][] m3 = (float[][][]) v;
+        int a = m3.length, b = (a>0? m3[0].length:0), c = (b>0? m3[0][0].length:0);
+        // Prefer [1,T,F] -> T=b, F=c
+        if (a == 1 && b > 1 && c > 1) return m3[0];
+        // Handle [T,F,1] -> drop last singleton
+        if (c == 1 && a > 0 && b > 0) {
+            float[][] out = new float[a][b];
+            for (int i = 0; i < a; i++)
+                for (int j = 0; j < b; j++)
+                    out[i][j] = m3[i][j][0];
+            return out;
+        }
+        // Fallback: choose F from common set
+        return coerceByGuessingTF3D(m3);
+} else if (v instanceof float[][][][]) {
+    float[][][][] m4 = (float[][][][]) v;
+    int a = m4.length;
+    int b = (a>0? m4[0].length:0);
+    int c = (b>0? m4[0][0].length:0);
+    int d = (c>0? m4[0][0][0].length:0);
+
+    // [1,1,T,F]  -> ok even if T==1
+    if (a == 1 && b == 1 && c >= 1 && d >= 1) {
+        float[][] out = new float[c][d];
+        for (int i = 0; i < c; i++)
+            System.arraycopy(m4[0][0][i], 0, out[i], 0, d);
+        return out;
+    }
+    // [1,T,F,1]  -> ok even if T==1
+    if (a == 1 && b >= 1 && c >= 1 && d == 1) {
+        float[][] out = new float[b][c];
+        for (int i = 0; i < b; i++)
+            for (int j = 0; j < c; j++)
+                out[i][j] = m4[0][i][j][0];
+        return out;
+    }
+
+    // Generic singleton permutations: pick F from {32,40,64,80,96}, T = any other dim >=1
+    int[] dims = new int[]{a,b,c,d};
+    int[] commonF = new int[]{32,40,64,80,96};
+    int fIdx = -1, F = -1;
+    for (int idx = 0; idx < 4 && fIdx==-1; idx++) {
+        for (int cf : commonF) {
+            if (dims[idx] == cf) { fIdx = idx; F = cf; break; }
+        }
+    }
+    if (fIdx != -1) {
+        int tIdx = -1, T = -1;
+        for (int idx = 0; idx < 4; idx++) {
+            if (idx == fIdx) continue;
+            int val = dims[idx];
+            if (val >= 1 && val > T) { T = val; tIdx = idx; }
+        }
+        if (T >= 1) {
+            float[][] out = new float[T][F];
+            for (int ti = 0; ti < T; ti++) {
+                for (int fj = 0; fj < F; fj++) {
+                    out[ti][fj] = get4(m4, tIdx, ti, fIdx, fj);
+                }
+            }
+            return out;
+        }
+    }
+
+    // Last resort: flatten to 1D then reshape if possible (handles very odd exports)
+    int N = a*b*c*d;
+    float[] flat = new float[N];
+    int idx = 0;
+    for (int i=0;i<a;i++)
+        for (int j=0;j<b;j++)
+            for (int k=0;k<c;k++)
+                for (int l=0;l<d;l++)
+                    flat[idx++] = m4[i][j][k][l];
+    int[] common = new int[]{32,40,64,80,96};
+    for (int CF: common) {
+        if (N % CF == 0) {
+            int T = N / CF;
+            float[][] out = new float[T][CF];
+            int p = 0;
+            for (int i=0;i<T;i++) {
+                System.arraycopy(flat, p, out[i], 0, CF);
+                p += CF;
+            }
+            return out;
+        }
+    }
+    throw new IllegalArgumentException("Unsupported 4D mel layout: ["+a+","+b+","+c+","+d+"]");
+} else if (v instanceof float[]) {
+        float[] m1 = (float[]) v; // flat vector; try to infer F and T
+        int N = m1.length;
+        int[] commonF = new int[]{32,40,64,80,96};
+        for (int F : commonF) {
+            if (N % F == 0) {
+                int T = N / F;
+                float[][] out = new float[T][F];
+                int idx = 0;
+                for (int i = 0; i < T; i++) {
+                    System.arraycopy(m1, idx, out[i], 0, F);
+                    idx += F;
+                }
+                return out;
+            }
+        }
+        throw new IllegalArgumentException("MelSpec 1D cannot be reshaped; len="+N);
+    } else {
+        throw new IllegalArgumentException("Unsupported mel type: " + v.getClass());
+    }
+}
+
+// Helper to read value from arbitrary 4D layout by logical T and F indices.
+private static float get4(float[][][][] m4, int tIdx, int t, int fIdx, int f) {
+    // map (tIdx, fIdx) -> indices (a,b,c,d). Any remaining singleton dims -> 0
+    int a = 0, b = 0, c = 0, d = 0;
+    if (tIdx == 0) a = t; else if (fIdx == 0) a = f;
+    if (tIdx == 1) b = t; else if (fIdx == 1) b = f;
+    if (tIdx == 2) c = t; else if (fIdx == 2) c = f;
+    if (tIdx == 3) d = t; else if (fIdx == 3) d = f;
+    return m4[a][b][c][d];
+}
+
+// Fallback for odd 3D layouts
+private static float[][] coerceByGuessingTF3D(float[][][] m3) {
+    int a = m3.length, b = (a>0? m3[0].length:0), c = (b>0? m3[0][0].length:0);
+    int[] commonF = new int[]{32,40,64,80,96};
+    // try (T=a,F=b)
+    for (int cf: commonF) if (b==cf && a>1 && c==1) {
+        float[][] out = new float[a][b];
+        for (int i=0;i<a;i++) System.arraycopy(m3[i][0], 0, out[i], 0, b);
+        return out;
+    }
+    // try (T=b,F=c) when a==1 handled earlier
+    // try (T=a,F=c) with b==1
+    if (b==1 && c>1 && a>1) {
+        float[][] out = new float[a][c];
+        for (int i=0;i<a;i++)
+            System.arraycopy(m3[i][0], 0, out[i], 0, c);
+        return out;
+    }
+    throw new IllegalArgumentException("Unsupported 3D mel layout: ["+a+","+b+","+c+"]");
+}
+
     private float[][] getMelspectrogram(float[] audioDataFloat) {
         //long t0 = tNow();
+        //Log.d(TAG, "getMelspectrogram()");
 
         long[] inputShape = new long[]{1, audioDataFloat.length};
         OnnxTensor inputTensor = null;
@@ -1174,17 +1370,18 @@ public class KeyWordsDetection {
 
             //long tRun0 = tNow();
             result = melspecSession.run(inputs);
-            //Log.d(TAG, "melspecSession.run: " + tMs(tRun0));
+            ////Log.d(TAG, "melspecSession.run: " + tMs(tRun0));
 
             Object output = result.get(0).getValue();
-            float[][][][] melspectrogram4D = (float[][][][]) output;
-            float[][] melspectrogram = (float [][]) squeeze4D(melspectrogram4D);
-
+            // float[][][][] melspectrogram4D = (float[][][][]) output;
+            // float[][] melspectrogram = (float [][]) squeeze4D(melspectrogram4D);
+            float[][] melspectrogram = coerceMelTo2D(output);
+            
             //long tTf0 = tNow();
             Function<Float, Float> melspecTransform = x -> x / 10 + 2;
             float [][] spec = transform(melspectrogram, melspecTransform);
-            //Log.d(TAG, "melspec transform: " + tMs(tTf0));
-            //Log.d(TAG, "getMelspectrogram total: " + tMs(t0) + " (len=" + audioDataFloat.length + ")");
+            ////Log.d(TAG, "melspec transform: " + tMs(tTf0));
+            ////Log.d(TAG, "getMelspectrogram total: " + tMs(t0) + " (len=" + audioDataFloat.length + ")");
             return spec;
         } catch (Exception e) {
             Log.e(TAG, "Failed to run melspectrogram session: " + e.getMessage());
@@ -1200,7 +1397,7 @@ public class KeyWordsDetection {
     public static List<float[][]> extractWindows(float[][] spec, int windowSize) {
         List<float[][]> windows = new ArrayList<>();
 
-        for (int i = 0; i <= spec.length - windowSize; i += 8) {
+        for (int i = 0; i <= spec.length - windowSize; i += Constants.STEP_SIZE) {
             if (spec.length - i >= windowSize) {
                 float[][] window = new float[windowSize][];
                 for (int j = 0; j < windowSize; j++) {
@@ -1268,11 +1465,11 @@ public class KeyWordsDetection {
             embeddingInputsReusable.clear();
             String embName = embeddingInputNames.iterator().next();
             embeddingInputsReusable.put(embName, inputTensor);
-            //Log.d(TAG, "embeddings make tensor (batch): " + tMs(tMake));
+            // //Log.d(TAG, "embeddings make tensor (batch): " + tMs(tMake));
 
             //long tRun = tNow();
             result = embeddingSession.run(embeddingInputsReusable);
-            //Log.d(TAG, "embeddingSession.run (batch): " + tMs(tRun));
+            // //Log.d(TAG, "embeddingSession.run (batch): " + tMs(tRun));
 
             float[][][][] outputTensor = (float[][][][]) result.get(0).getValue();
 
@@ -1292,7 +1489,7 @@ public class KeyWordsDetection {
                     }
                 }
             }
-            //Log.d(TAG, "getEmbeddings (batch) total: " + tMs(t0));
+            // //Log.d(TAG, "getEmbeddings (batch) total: " + tMs(t0));
             return embeddings;
         } catch (Exception e) {
             Log.e(TAG, "Failed to run prediction session: " + e.getMessage());
@@ -1336,22 +1533,28 @@ public class KeyWordsDetection {
     private float detectFromMicrophone(short[] audioData, boolean computeEmbedding, boolean flushEmbedNow) throws OrtException {
         //long t0 = tNow();
 
+        //Log.d(TAG,"detectFromMicrophone()");
         bufferRawData(audioData);
+        if (rawDataBuffer.size() < MIN_COLLECT_SAMPLES) {
+            //Log.d(TAG,"detectHeadCollect() rawDataBuffer.size() < MIN_COLLECT_SAMPLES");
+            // Not enough audio yet; keep accumulating
+            return 0.0f;
+        }
 
         //long tMel = tNow();
         streamingMelspectrogram(audioData.length);
-        //Log.d(TAG, "streamingMelspectrogram (detectFromMicrophone): " + tMs(tMel));
+        // //Log.d(TAG, "streamingMelspectrogram (detectFromMicrophone): " + tMs(tMel));
 
         if (!computeEmbedding) {
             //Log.d(TAG, "detectFromMicrophone: skip embedding (head)");
-            //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
+            // //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
             return 0.0f;
         }
 
         int ndx = getMelNumberOfRows();
         if (ndx < 76) {
             //Log.d(TAG, "detectFromMicrophone: not enough mel rows yet");
-            //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
+            // //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
             return 0.0f;
         }
 
@@ -1364,7 +1567,7 @@ public class KeyWordsDetection {
         one.add(flattenedSubArray);
         runEmbeddingBatch(one); // this will push into featureDeque
 
-        //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
+        // //Log.d(TAG, "detectFromMicrophone total: " + tMs(t0));
         return 0.0f;
     }
 
@@ -1391,11 +1594,9 @@ public class KeyWordsDetection {
             embeddingInputsReusable.clear();
             String embName = embeddingInputNames.iterator().next();
             embeddingInputsReusable.put(embName, inputTensor);
-            //Log.d(TAG, "embeddings make tensor (batched N=" + windows.size() + "): " + tMs(tMake));
 
             //long tRun = tNow();
             result = embeddingSession.run(embeddingInputsReusable);
-            //Log.d(TAG, "embeddingSession.run (batch N=" + windows.size() + "): " + tMs(tRun));
 
             float[][][][] outputTensor = (float[][][][]) result.get(0).getValue();
             int dim0 = outputTensor.length;
@@ -1412,7 +1613,6 @@ public class KeyWordsDetection {
                             row[index++] = outputTensor[i][j][k][l];
                 updateFeatureQueue(row);
             }
-            //Log.d(TAG, "getEmbeddingsFromMelspectrogram (batched " + windows.size() + ") total: " + tMs(tEmb));
         } catch (Exception e) {
             Log.e(TAG, "runEmbeddingBatch failed: " + e.getMessage());
         } finally {
@@ -1472,7 +1672,6 @@ public class KeyWordsDetection {
             features, 0, nFeatureFrames[model_i]);
 
         float[] flattenedFeatures = flatten(features);
-        //Log.d(TAG, "predict pack/flatten: " + tMs(tPack));
 
         OnnxTensor inputTensor = null;
         OrtSession.Result result = null;
@@ -1483,15 +1682,12 @@ public class KeyWordsDetection {
             inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flattenedFeatures), shape);
             inputs = new HashMap<>();
             inputs.put(inputNames[model_i].get(0), inputTensor);
-            //Log.d(TAG, "predict make tensor: " + tMs(tMake));
 
             //long tRun = tNow();
             result = sessions[model_i].run(inputs);
-            //Log.d(TAG, "predict run[" + strippedModelNames[model_i] + "]: " + tMs(tRun));
 
             float[][] outputData2D = (float[][]) result.get(0).getValue();
             float prediction = outputData2D[0][0];
-            //Log.d(TAG, "predict total: " + tMs(t0));
             return prediction;
         } catch (Exception e) {
             Log.e(TAG, "Failed to run prediction session: " + e.getMessage());
@@ -1531,7 +1727,6 @@ public class KeyWordsDetection {
         try {
             //long tFlat = tNow();
             float[] flattenedMelspectrogram = flatten4D(new float[][][][]{new float[][][]{melspectrogram}});
-            //Log.d(TAG, "embed flatten: " + tMs(tFlat));
 
             inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flattenedMelspectrogram), shape);
             inputs = new HashMap<>();
@@ -1540,7 +1735,6 @@ public class KeyWordsDetection {
 
             //long tRun = tNow();
             result = embeddingSession.run(inputs);
-            //Log.d(TAG, "embeddingSession.run: " + tMs(tRun));
 
             float[][][][] outputTensor = (float[][][][]) result.get(0).getValue();
 
@@ -1560,7 +1754,6 @@ public class KeyWordsDetection {
                     }
                 }
             }
-            //Log.d(TAG, "getEmbeddingsFromMelspectrogram total: " + tMs(t0));
             return embeddings;
         } catch (Exception e) {
             Log.e(TAG, "getEmbeddingsFromMelspectrogram failed: " + e.getMessage());
@@ -1910,7 +2103,7 @@ public class KeyWordsDetection {
                 System.arraycopy(pcm, offsetSamples, tail, 0, remain);
                 pushNextFrame(tail, tail.length);
             }
-            Log.d(TAG, "runExternalOnRawAsset_AllAtOnce(): pushed '" + assetName + "', samples=" + pcm.length);
+            //Log.d(TAG, "runExternalOnRawAsset_AllAtOnce(): pushed '" + assetName + "', samples=" + pcm.length);
         } catch (Throwable e) {
             Log.e(TAG, "runExternalOnRawAsset_AllAtOnce failed for " + assetName, e);
             stopListening();
@@ -1918,7 +2111,7 @@ public class KeyWordsDetection {
     }
     
     public void runExternalOnRawAsset_Stream(String assetName, boolean skipFirst2s) {
-        final int F = Constants.FRAME_LENGTH * 8;
+        final int F = Constants.FRAME_LENGTH;
         AssetManager am = context.getAssets();
 
         try (InputStream in = am.open(assetName);
@@ -1952,7 +2145,7 @@ public class KeyWordsDetection {
 
                 if (off < b.length) break;
             }
-            Log.d(TAG, "runExternalOnRawAsset_Stream(): streamed '" + assetName + "'");
+            //Log.d(TAG, "runExternalOnRawAsset_Stream(): streamed '" + assetName + "'");
         } catch (Throwable e) {
             Log.e(TAG, "runExternalOnRawAsset_Stream failed for " + assetName, e);
             stopListening();

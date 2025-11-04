@@ -7,3 +7,5 @@
 # cp MyLibrary/build/outputs/aar/MyLibrary-release.aar ../porcuSafe/android/app/libs/MyLibrary-release.aar
 
 cp MyLibrary/build/outputs/aar/MyLibrary-release.aar ../android-hotword/android_perplexity/libs/ai/perplexity/hotword/1.0.0/keyworddetection-1.0.0.aar
+
+cp MyLibrary/build/outputs/aar/MyLibrary-release.aar ../android-hotword/SidTest/app/libs/keyworddetection-1.0.0.aar
